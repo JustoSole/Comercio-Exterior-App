@@ -11,6 +11,7 @@ Flujo simplificado:
 5. Mostrar landed cost total con transparencia completa
 
 Versión simplificada con datos reales
+Última actualización: 2025-01-21 - Secrets fix v2
 """
 
 import streamlit as st
