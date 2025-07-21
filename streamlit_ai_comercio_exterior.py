@@ -29,8 +29,38 @@ import re
 import asyncio
 import io
 
-# Import del gestor de secrets
-from secrets_config import get_api_keys_dict, validate_setup, get_secrets_manager
+# Import del gestor de secrets - Usando secrets nativos de Streamlit
+def get_api_keys_dict():
+    """Obtener API keys desde los secrets de Streamlit"""
+    try:
+        return {
+            "OPENAI_API_KEY": st.secrets["api_keys"]["OPENAI_API_KEY"],
+            "APIFY_API_KEY": st.secrets["api_keys"]["APIFY_API_KEY"],
+            "EASYPOST_API_KEY": st.secrets["api_keys"].get("EASYPOST_API_KEY", ""),
+            "EASYPOST_API_KEY_TEST": st.secrets["api_keys"].get("EASYPOST_API_KEY_TEST", ""),
+            "EASYPOST_WEBHOOK_SECRET": st.secrets["api_keys"].get("EASYPOST_WEBHOOK_SECRET", "")
+        }
+    except Exception as e:
+        st.error(f"Error cargando API keys: {e}")
+        return {}
+
+def validate_setup():
+    """Validar que las API keys principales estén configuradas"""
+    try:
+        api_keys = get_api_keys_dict()
+        required_keys = ["OPENAI_API_KEY", "APIFY_API_KEY"]
+        missing_keys = [key for key in required_keys if not api_keys.get(key)]
+        
+        if missing_keys:
+            st.error(f"❌ API keys faltantes: {', '.join(missing_keys)}")
+            return False
+        return True
+    except Exception:
+        return False
+
+def get_secrets_manager():
+    """Función de compatibilidad - devuelve los secrets de Streamlit"""
+    return st.secrets
 
 # Cargar API keys desde el archivo centralizado
 API_KEYS = get_api_keys_dict()
