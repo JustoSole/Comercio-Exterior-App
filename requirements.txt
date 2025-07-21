@@ -1,0 +1,53 @@
+# Core dependencies
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy<2.0.0
+
+# Apify integration (scraping)
+apify-client>=1.7.0
+
+# Data visualization
+plotly>=5.15.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Image processing
+Pillow>=10.0.0
+
+# API and web requests
+requests>=2.31.0
+urllib3>=2.0.0
+
+# PDF processing
+reportlab>=4.0.0
+camelot-py[cv]>=0.11.0 # Requires ghostscript to be installed on the system
+
+# Excel processing
+openpyxl>=3.1.0
+xlsxwriter>=3.1.0
+
+# Data parsing and processing
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+
+# OpenAI integration
+openai>=1.0.0
+
+# EasyPost integration (shipping)
+easypost>=6.0.0
+
+# Date and time handling
+python-dateutil>=2.8.0
+
+# JSON and data serialization
+jsonschema>=4.18.0
+
+# Environment variables
+python-dotenv>=1.0.0
+
+# Utilities
+tqdm>=4.65.0
+charset-normalizer>=3.2.0
+
+# Configuration files
+toml>=0.10.0 
