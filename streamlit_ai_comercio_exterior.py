@@ -1454,28 +1454,21 @@ def show_calculator_table():
     )
     st.divider()
 
-    # Crear tabs principales
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "💰 Resumen Ejecutivo", 
-        "📊 Desglose Detallado", 
-        "📈 Análisis de Rentabilidad",
-        "📖 Clasificación NCM"
+    # Crear tabs principales - Desglose detallado separado
+    tab1, tab2 = st.tabs([
+        "📊 Análisis Completo", 
+        "🔍 Desglose Detallado (Expertos)"
     ])
     
     with tab1:
-        render_executive_summary_tab(result)
+        render_complete_analysis_tab(result)
     
     with tab2:
         render_detailed_breakdown_tab(result)
-    
-    with tab3:
-        render_profitability_analysis_tab(result)
-    
-    with tab4:
-        render_ncm_classification_tab(result)
 
-def render_executive_summary_tab(result):
-    """Renderiza el resumen ejecutivo con métricas principales"""
+def render_complete_analysis_tab(result):
+    """Renderiza el análisis completo como estaba antes"""
+    # Crear tabla principal de costos
     st.markdown("#### 💰 Desglose de Costo Unitario")
     
     # Calcular valores
@@ -1611,233 +1604,93 @@ def render_executive_summary_tab(result):
     )
     st.plotly_chart(fig_pie, use_container_width=True)
 
-def render_detailed_breakdown_tab(result):
-    """Renderiza el desglose detallado paso a paso siguiendo la metodología correcta"""
-    st.markdown("## 🔍 Desglose Detallado del Landed Cost")
-    st.markdown("*Siguiendo la metodología profesional de importaciones*")
-    
-    # Obtener datos básicos
-    import_quantity = result['configuracion'].get('import_quantity', 1)
-    precio_unitario = result['precio_base']
-    tax_result = result['tax_result']
-    cotizacion = result['configuracion'].get('cotizacion_dolar', 1000)
-    flete_unitario = result['costo_flete_usd']
-    honorarios_unitario = result['configuracion'].get('honorarios_despachante', 0)
-    
-    # PASO 1: FOB (Free On Board)
-    st.markdown("### 📦 PASO 1: Valor FOB (Free On Board)")
-    st.markdown("""
-    **Definición:** El valor FOB incluye el costo del producto más todos los gastos en origen 
-    (embalaje, documentación, carga al medio de transporte, etc.)
-    """)
-    
-    fob_unitario = precio_unitario
-    fob_total = fob_unitario * import_quantity
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("FOB Unitario", f"${fob_unitario:.2f} USD")
-        st.metric("Cantidad a Importar", f"{import_quantity} unidades")
-    with col2:
-        st.metric("FOB Total", f"${fob_total:.2f} USD", help="FOB Unitario × Cantidad")
-        st.metric("FOB Total (ARS)", f"${fob_total * cotizacion:,.0f} ARS")
-    
-    st.markdown("**Cálculo:** FOB Total = FOB Unitario × Cantidad")
-    st.code(f"FOB Total = ${fob_unitario:.2f} × {import_quantity} = ${fob_total:.2f} USD")
-    
-    # PASO 2: CIF (Cost, Insurance & Freight)
-    st.markdown("### 🚢 PASO 2: Valor CIF (Cost, Insurance & Freight)")
-    st.markdown("""
-    **Definición:** El valor CIF es el FOB más los costos de flete internacional y seguro.
-    Este valor se convierte en el **Valor en Aduana** sobre el cual se calculan derechos y tasas.
-    """)
-    
-    flete_total = flete_unitario * import_quantity
-    seguro_total = fob_total * 0.005  # 0.5% típico para seguro
-    cif_total = fob_total + flete_total + seguro_total
-    cif_unitario = cif_total / import_quantity
-    
-    # Mostrar desglose del CIF
-    cif_breakdown = pd.DataFrame([
-        {"Concepto": "FOB Total", "Valor USD": f"${fob_total:.2f}", "Descripción": "Costo del producto en origen"},
-        {"Concepto": "Flete Internacional", "Valor USD": f"${flete_total:.2f}", "Descripción": "Transporte hasta destino"},
-        {"Concepto": "Seguro", "Valor USD": f"${seguro_total:.2f}", "Descripción": "Cobertura de la mercadería (0.5%)"},
-        {"Concepto": "TOTAL CIF", "Valor USD": f"${cif_total:.2f}", "Descripción": "Valor en Aduana"}
-    ])
-    
-    st.dataframe(cif_breakdown, use_container_width=True, hide_index=True)
-    
-    st.metric("**Valor en Aduana (CIF)**", f"${cif_total:.2f} USD", 
-              help="Este es el valor sobre el cual se calculan derechos y tasa estadística")
-    
-    st.markdown("**Cálculo:** CIF = FOB + Flete + Seguro")
-    st.code(f"CIF = ${fob_total:.2f} + ${flete_total:.2f} + ${seguro_total:.2f} = ${cif_total:.2f} USD")
-    
-    # PASO 3: Derechos de Importación y Tasa Estadística
-    st.markdown("### 🏛️ PASO 3: Derechos de Importación y Tasa Estadística")
-    st.markdown("""
-    **Definición:** Estos impuestos se calculan sobre el **Valor en Aduana (CIF)**.
-    Son los primeros tributos que se aplican en el proceso de nacionalización.
-    """)
-    
-    # Encontrar derechos de importación y tasa estadística
-    derechos_monto = 0
-    tasa_estadistica_monto = 0
-    derechos_alicuota = 0
-    tasa_estadistica_alicuota = 3.0  # Estándar 3%
-    
-    for impuesto in tax_result.impuestos:
-        if impuesto.aplica:
-            if "derechos" in impuesto.nombre.lower() or "importacion" in impuesto.nombre.lower():
-                derechos_monto = float(impuesto.monto) * import_quantity
-                derechos_alicuota = float(impuesto.alicuota) * 100
-            elif "estadistica" in impuesto.nombre.lower() or "tasa" in impuesto.nombre.lower():
-                tasa_estadistica_monto = float(impuesto.monto) * import_quantity
-    
-    # Si no encontramos tasa estadística, calcularla
-    if tasa_estadistica_monto == 0:
-        tasa_estadistica_monto = cif_total * 0.03
-    
-    valor_despues_derechos = cif_total + derechos_monto + tasa_estadistica_monto
-    
-    derechos_breakdown = pd.DataFrame([
-        {"Concepto": "Valor en Aduana (CIF)", "Base Cálculo": f"${cif_total:.2f}", "Alícuota": "-", "Monto USD": f"${cif_total:.2f}"},
-        {"Concepto": "Derechos de Importación", "Base Cálculo": f"${cif_total:.2f}", "Alícuota": f"{derechos_alicuota:.1f}%", "Monto USD": f"${derechos_monto:.2f}"},
-        {"Concepto": "Tasa Estadística", "Base Cálculo": f"${cif_total:.2f}", "Alícuota": f"{tasa_estadistica_alicuota:.1f}%", "Monto USD": f"${tasa_estadistica_monto:.2f}"},
-        {"Concepto": "SUBTOTAL", "Base Cálculo": "-", "Alícuota": "-", "Monto USD": f"${valor_despues_derechos:.2f}"}
-    ])
-    
-    st.dataframe(derechos_breakdown, use_container_width=True, hide_index=True)
-    
-    st.markdown("**Cálculos:**")
-    st.code(f"""
-Derechos de Importación = ${cif_total:.2f} × {derechos_alicuota:.1f}% = ${derechos_monto:.2f} USD
-Tasa Estadística = ${cif_total:.2f} × {tasa_estadistica_alicuota:.1f}% = ${tasa_estadistica_monto:.2f} USD
-    """)
-    
-    # PASO 4: Base IVA y otros impuestos
-    st.markdown("### 💹 PASO 4: Base IVA y Otros Impuestos")
-    st.markdown("""
-    **Definición:** La Base IVA se calcula como: CIF + Derechos + Tasa Estadística.
-    Sobre esta base se calculan: IVA, IVA Adicional, Impuesto a las Ganancias e Ingresos Brutos.
-    """)
-    
-    base_iva = valor_despues_derechos
-    
-    # Encontrar otros impuestos
-    iva_monto = 0
-    iva_adicional_monto = 0
-    ganancias_monto = 0
-    iibb_monto = 0
-    
-    for impuesto in tax_result.impuestos:
-        if impuesto.aplica:
-            monto_total = float(impuesto.monto) * import_quantity
-            nombre_lower = impuesto.nombre.lower()
-            
-            if "iva" in nombre_lower and "adicional" not in nombre_lower:
-                iva_monto = monto_total
-                iva_alicuota = float(impuesto.alicuota) * 100
-            elif "adicional" in nombre_lower:
-                iva_adicional_monto = monto_total
-                iva_adicional_alicuota = float(impuesto.alicuota) * 100
-            elif "ganancias" in nombre_lower:
-                ganancias_monto = monto_total
-                ganancias_alicuota = float(impuesto.alicuota) * 100
-            elif "brutos" in nombre_lower or "iibb" in nombre_lower:
-                iibb_monto = monto_total
-                iibb_alicuota = float(impuesto.alicuota) * 100
-    
-    total_impuestos_iva = iva_monto + iva_adicional_monto + ganancias_monto + iibb_monto
-    valor_despues_impuestos = base_iva + total_impuestos_iva
-    
-    impuestos_breakdown = pd.DataFrame([
-        {"Concepto": "Base IVA", "Base Cálculo": "-", "Alícuota": "-", "Monto USD": f"${base_iva:.2f}"},
-        {"Concepto": "IVA General", "Base Cálculo": f"${base_iva:.2f}", "Alícuota": f"{iva_alicuota:.1f}%" if 'iva_alicuota' in locals() else "21.0%", "Monto USD": f"${iva_monto:.2f}"},
-        {"Concepto": "IVA Adicional", "Base Cálculo": f"${base_iva:.2f}", "Alícuota": f"{iva_adicional_alicuota:.1f}%" if 'iva_adicional_alicuota' in locals() else "0.0%", "Monto USD": f"${iva_adicional_monto:.2f}"},
-        {"Concepto": "Imp. Ganancias", "Base Cálculo": f"${base_iva:.2f}", "Alícuota": f"{ganancias_alicuota:.1f}%" if 'ganancias_alicuota' in locals() else "6.0%", "Monto USD": f"${ganancias_monto:.2f}"},
-        {"Concepto": "Ingresos Brutos", "Base Cálculo": f"${base_iva:.2f}", "Alícuota": f"{iibb_alicuota:.1f}%" if 'iibb_alicuota' in locals() else "3.0%", "Monto USD": f"${iibb_monto:.2f}"},
-        {"Concepto": "SUBTOTAL con Impuestos", "Base Cálculo": "-", "Alícuota": "-", "Monto USD": f"${valor_despues_impuestos:.2f}"}
-    ])
-    
-    st.dataframe(impuestos_breakdown, use_container_width=True, hide_index=True)
-    
-    st.metric("**Base IVA**", f"${base_iva:.2f} USD", 
-              help="CIF + Derechos + Tasa Estadística = Base sobre la cual se calculan los demás impuestos")
-    
-    # PASO 5: Otros Costos
-    st.markdown("### 💼 PASO 5: Otros Costos de Nacionalización")
-    st.markdown("""
-    **Definición:** Costos adicionales necesarios para completar la importación:
-    despachante de aduana, almacenaje, otros gastos portuarios.
-    """)
-    
-    honorarios_total = honorarios_unitario * import_quantity
-    otros_gastos = 0  # Puedes expandir esto si tienes más gastos
-    
-    otros_costos = pd.DataFrame([
-        {"Concepto": "Honorarios Despachante", "Cálculo": f"${precio_unitario:.2f} × 2% × {import_quantity}", "Monto USD": f"${honorarios_total:.2f}"},
-        {"Concepto": "Otros Gastos", "Cálculo": "Almacenaje, gestiones, etc.", "Monto USD": f"${otros_gastos:.2f}"},
-        {"Concepto": "TOTAL Otros Costos", "Cálculo": "-", "Monto USD": f"${honorarios_total + otros_gastos:.2f}"}
-    ])
-    
-    st.dataframe(otros_costos, use_container_width=True, hide_index=True)
-    
-    # PASO 6: LANDED COST FINAL
-    st.markdown("### 🎯 PASO 6: LANDED COST TOTAL")
-    st.markdown("""
-    **Definición:** El costo final que incluye todos los gastos necesarios para tener el producto 
-    disponible en destino, listo para la venta.
-    """)
-    
-    landed_cost_total = valor_despues_impuestos + honorarios_total + otros_gastos
-    landed_cost_unitario_final = landed_cost_total / import_quantity
-    
-    # Resumen final
-    resumen_final = pd.DataFrame([
-        {"Etapa": "FOB Total", "Descripción": "Costo del producto en origen", "Monto USD": f"${fob_total:.2f}", "% del Total": f"{(fob_total/landed_cost_total)*100:.1f}%"},
-        {"Etapa": "CIF (Valor Aduana)", "Descripción": "FOB + Flete + Seguro", "Monto USD": f"${cif_total:.2f}", "% del Total": f"{(cif_total/landed_cost_total)*100:.1f}%"},
-        {"Etapa": "Derechos y Tasas", "Descripción": "Impuestos sobre CIF", "Monto USD": f"${derechos_monto + tasa_estadistica_monto:.2f}", "% del Total": f"{((derechos_monto + tasa_estadistica_monto)/landed_cost_total)*100:.1f}%"},
-        {"Etapa": "Impuestos Internos", "Descripción": "IVA, Ganancias, IIBB", "Monto USD": f"${total_impuestos_iva:.2f}", "% del Total": f"{(total_impuestos_iva/landed_cost_total)*100:.1f}%"},
-        {"Etapa": "Otros Costos", "Descripción": "Despachante, gestiones", "Monto USD": f"${honorarios_total + otros_gastos:.2f}", "% del Total": f"{((honorarios_total + otros_gastos)/landed_cost_total)*100:.1f}%"},
-        {"Etapa": "LANDED COST TOTAL", "Descripción": f"Para {import_quantity} unidades", "Monto USD": f"${landed_cost_total:.2f}", "% del Total": "100.0%"}
-    ])
-    
-    # Aplicar estilo al resumen
-    def highlight_total(row):
-        if "TOTAL" in row['Etapa']:
-            return ['background-color: #28a745; color: white; font-weight: bold'] * len(row)
-        else:
-            return [''] * len(row)
-    
-    st.dataframe(
-        resumen_final.style.apply(highlight_total, axis=1),
-        use_container_width=True,
-        hide_index=True
-    )
-    
-    # Métricas finales destacadas
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        st.metric("**Landed Cost Total**", f"${landed_cost_total:.2f} USD")
-    with col2:
-        st.metric("**Landed Cost Unitario**", f"${landed_cost_unitario_final:.2f} USD")
-    with col3:
-        markup_percent = ((landed_cost_unitario_final - fob_unitario) / fob_unitario) * 100
-        st.metric("**Markup Total**", f"{markup_percent:.1f}%", help="Incremento sobre el precio FOB original")
-    
-    # Equivalencia en ARS
-    st.markdown("#### 💵 Equivalencia en Pesos Argentinos")
-    st.metric("Landed Cost Total (ARS)", f"${landed_cost_total * cotizacion:,.0f} ARS", 
-              help=f"Cotización utilizada: ${cotizacion:.2f} ARS/USD")
+    # Añadir tabla de landed cost por cantidad
+    pricing_info = result['product'].pricing
+    if hasattr(pricing_info, 'ladder_prices') and pricing_info.ladder_prices:
+        st.markdown("#### 💰 Landed Cost por Volumen de Compra")
+        
+        # Extraer derechos de importación para cálculo por tiers
+        derechos_importacion_pct = _get_duties_from_ncm_result(result.get('ncm_result', {}))
 
-def render_profitability_analysis_tab(result):
-    """Renderiza el análisis de rentabilidad"""
+        landed_cost_tiers = []
+        cotizacion = result.get('cotizacion_dolar', 1220)
+        # Usar el landed cost de la opción más barata como base para comparación
+        base_landed_cost_unitario = result['landed_cost']
+
+        for tier in pricing_info.ladder_prices:
+            if 'price' not in tier or 'min' not in tier:
+                continue
+            
+            price = float(tier['price'])
+            min_quantity = int(tier['min'])
+
+            # Recalcular componentes para este tier
+            tax_result_tier = calcular_impuestos_importacion(
+                cif_value=price,
+                tipo_importador=result['configuracion'].get('tipo_importador', 'responsable_inscripto'),
+                destino=result['configuracion'].get('destino_importacion', 'reventa'),
+                origen="extrazona",
+                tipo_dolar=result['configuracion'].get('tipo_dolar', 'oficial'),
+                provincia=result['configuracion'].get('provincia', 'CABA'),
+                derechos_importacion_pct=derechos_importacion_pct
+            )
+            
+            impuestos_total_tier = float(tax_result_tier.total_impuestos)
+            # Simplificamos el flete y honorarios como un % del FOB para la tabla comparativa
+            flete_costo_estimado_tier = price * 0.15 
+            honorarios_despachante_tier = price * 0.02
+            
+            landed_cost_unitario_tier = price + impuestos_total_tier + flete_costo_estimado_tier + honorarios_despachante_tier
+            
+            # Calcular ahorro vs el costo base (opción más barata)
+            ahorro_unitario = base_landed_cost_unitario - landed_cost_unitario_tier
+            
+            landed_cost_tiers.append({
+                "Cantidad Mínima": f"{min_quantity}{'+' if tier.get('max', -1) == -1 else '-' + str(tier['max'])}",
+                "Precio FOB Unitario": f"${price:.2f}",
+                "Landed Cost Unitario": f"${landed_cost_unitario_tier:.2f}",
+                "Ahorro Unitario vs Base": f"${ahorro_unitario:.2f}" if ahorro_unitario > 0.01 else "-",
+                "Costo Total Lote (USD)": f"${landed_cost_unitario_tier * min_quantity:,.2f}",
+            })
+
+        if landed_cost_tiers:
+            df_tiers = pd.DataFrame(landed_cost_tiers)
+            st.dataframe(df_tiers, use_container_width=True, hide_index=True)
+    else:
+        st.info("ℹ️ No se encontraron precios específicos por volumen para este producto.")
+
+    # Tabla detallada de impuestos
+    st.markdown("#### 🏛️ Detalle de Impuestos")
+    
+    impuestos_detalle = []
+    for impuesto in result['tax_result'].impuestos:
+        if impuesto.aplica:
+            monto_usd = float(impuesto.monto)
+            impuestos_detalle.append({
+                "Impuesto": impuesto.nombre,
+                "Alícuota": f"{impuesto.alicuota:.2%}",
+                "Base USD": f"${impuesto.base_imponible:.2f}",
+                "Monto USD": f"${monto_usd:.2f}",
+                "Monto ARS": f"${monto_usd * cotizacion:,.0f}",
+                "Estado": "✅ Aplica"
+            })
+        else:
+            impuestos_detalle.append({
+                "Impuesto": impuesto.nombre,
+                "Alícuota": "N/A",
+                "Base USD": "N/A",
+                "Monto USD": "$0.00",
+                "Monto ARS": "$0",
+                "Estado": "❌ No Aplica"
+            })
+    
+    if impuestos_detalle:
+        df_impuestos = pd.DataFrame(impuestos_detalle)
+        st.dataframe(df_impuestos, use_container_width=True, hide_index=True)
+    
+    # Análisis de Rentabilidad por Canal de Venta
     st.markdown("#### 📈 Análisis de Rentabilidad por Canal de Venta")
     st.markdown("*Precios de venta sugeridos para obtener la utilidad neta deseada, absorbiendo la comisión de cada plataforma.*")
-
-    landed_cost = result['landed_cost']
-    cotizacion = result['configuracion'].get('cotizacion_dolar', 1000)
 
     # Definir canales de venta y sus comisiones promedio
     canales_venta = {
@@ -1884,8 +1737,7 @@ def render_profitability_analysis_tab(result):
         df_rentabilidad = pd.DataFrame(data_for_df, columns=columns)
         st.dataframe(df_rentabilidad, use_container_width=True, hide_index=True)
 
-def render_ncm_classification_tab(result):
-    """Renderiza la información de clasificación NCM"""
+    # Información de clasificación arancelaria (NCM) con datos VUCE
     st.markdown("#### 📖 Clasificación Arancelaria (NCM) + VUCE")
     
     ncm_result = result['ncm_result']
