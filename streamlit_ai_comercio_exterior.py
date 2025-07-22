@@ -69,10 +69,13 @@ API_KEYS = get_api_keys_dict()
 # Configurar variables de entorno para compatibilidad
 os.environ['OPENAI_API_KEY'] = API_KEYS.get("OPENAI_API_KEY", "")
 
+# Configuración del archivo de datos NCM para integración refinada
+NCM_DATA_FILE = "pdf_reader/ncm/resultados_ncm_hybrid/dataset_ncm_HYBRID_FIXED_20250721_175449.csv"
+
 # Imports de módulos reales
 try:
     from alibaba_scraper import scrape_single_alibaba_product, extract_alibaba_pricing, format_pricing_for_display, calculate_total_cost_for_option, get_cheapest_price_option
-    from ai_ncm_classifier import AINcmClassifier
+    from integration_example import IntegratedNCMClassifier  # NUEVO: Clasificador integrado IA + Position Matcher
     from import_tax_calculator import calcular_impuestos_importacion
     from product_dimension_estimator import ProductShippingEstimator
     from freight_estimation import load_freight_rates, calculate_air_freight, calculate_sea_freight
@@ -513,22 +516,146 @@ def log_flow_step(step_name, status="STARTED", data=None):
     debug_log(f"Flow Step: {step_name} - {status}", data, level="FLOW")
 
 def _get_duties_from_ncm_result(ncm_result: dict) -> float:
-    """Extrae y parsea los derechos de importación desde el resultado de NCM."""
+    """Extrae y parsea los derechos de importación desde el resultado de NCM (integrado o clásico)."""
     if not ncm_result:
         return 0.0
     
-    tratamiento = ncm_result.get('tratamiento_arancelario', {})
-    derechos_str = tratamiento.get('derechos_importacion', '0.0%')
+    # PRIORIDAD ABSOLUTA: Datos oficiales del resultado integrado 
+    if 'final_recommendation' in ncm_result:
+        final_rec = ncm_result.get('final_recommendation', {})
+        fiscal_data = final_rec.get('fiscal_data', {})
+        
+        if 'aec' in fiscal_data:
+            try:
+                aec_value = float(fiscal_data['aec'])
+                debug_log(f"✅ Usando AEC oficial desde base de datos: {aec_value}%", level="SUCCESS")
+                return aec_value
+            except (ValueError, TypeError):
+                debug_log(f"⚠️ Error parseando AEC oficial: {fiscal_data['aec']}", level="WARNING")
+    
+    # SEGUNDA PRIORIDAD: Datos oficiales desde validation_info (Position Matcher)
+    if 'validation_info' in ncm_result:
+        validation = ncm_result.get('validation_info', {})
+        if validation.get('match_type') in ['exacto', 'aproximado']:
+            position = validation.get('position', {})
+            attributes = position.get('attributes', {})
+            
+            if 'aec' in attributes:
+                try:
+                    aec_value = float(attributes['aec'])
+                    debug_log(f"✅ Usando AEC oficial desde Position Matcher: {aec_value}%", level="SUCCESS")
+                    return aec_value
+                except (ValueError, TypeError):
+                    debug_log(f"⚠️ Error parseando AEC desde Position Matcher: {attributes['aec']}", level="WARNING")
+    
+    # TERCERA PRIORIDAD: Datos de IA (fallback)
+    ai_classification = ncm_result.get('ai_classification', {})
+    if ai_classification:
+        tratamiento = ai_classification.get('tratamiento_arancelario', {})
+        derechos_str = tratamiento.get('derechos_importacion', '0.0%')
+    else:
+        # Retrocompatibilidad: formato clásico (solo IA)
+        tratamiento = ncm_result.get('tratamiento_arancelario', {})
+        derechos_str = tratamiento.get('derechos_importacion', '0.0%')
     
     try:
         # Extrae solo los números y el punto decimal
         cleaned_str = re.sub(r'[^\d.]', '', str(derechos_str))
         if cleaned_str:
-            return float(cleaned_str)
+            parsed_value = float(cleaned_str)
+            debug_log(f"⚠️ Usando AEC desde IA (no hay datos oficiales): {parsed_value}%", level="WARNING")
+            return parsed_value
     except (ValueError, TypeError):
-        debug_log(f"No se pudo parsear derechos de importación: '{derechos_str}'. Usando 0.0%.", level="WARNING")
+        debug_log(f"❌ No se pudo parsear derechos de importación: '{derechos_str}'. Usando 0.0%.", level="ERROR")
     
     return 0.0
+
+def _get_all_official_taxes_from_ncm_result(ncm_result: dict) -> dict:
+    """Extrae TODOS los impuestos oficiales de la base de datos: aec, die, te, in, de, re"""
+    official_taxes = {
+        'aec': 0.0,
+        'die': 0.0, 
+        'te': 0.0,
+        'in': '',
+        'de': 0.0,
+        're': 0.0,
+        'source': 'IA'  # Indica la fuente de los datos
+    }
+    
+    if not ncm_result:
+        return official_taxes
+    
+    # PRIORIDAD 1: Datos oficiales del resultado integrado
+    if 'final_recommendation' in ncm_result:
+        final_rec = ncm_result.get('final_recommendation', {})
+        fiscal_data = final_rec.get('fiscal_data', {})
+        
+        if fiscal_data:
+            for field in ['aec', 'die', 'te', 'in', 'de', 're']:
+                if field in fiscal_data:
+                    try:
+                        if field == 'in':
+                            official_taxes[field] = str(fiscal_data[field])
+                        else:
+                            official_taxes[field] = float(fiscal_data[field])
+                    except (ValueError, TypeError):
+                        pass
+            
+            if any(official_taxes[f] for f in ['aec', 'die', 'te'] if isinstance(official_taxes[f], (int, float)) and official_taxes[f] > 0):
+                official_taxes['source'] = 'Base de Datos Oficial'
+                debug_log("✅ Usando impuestos oficiales completos desde base de datos", official_taxes, level="SUCCESS")
+                return official_taxes
+    
+    # PRIORIDAD 2: Position Matcher data
+    if 'validation_info' in ncm_result:
+        validation = ncm_result.get('validation_info', {})
+        if validation.get('match_type') in ['exacto', 'aproximado']:
+            position = validation.get('position', {})
+            attributes = position.get('attributes', {})
+            
+            if attributes:
+                for field in ['aec', 'die', 'te', 'in', 'de', 're']:
+                    if field in attributes:
+                        try:
+                            if field == 'in':
+                                official_taxes[field] = str(attributes[field])
+                            else:
+                                official_taxes[field] = float(attributes[field])
+                        except (ValueError, TypeError):
+                            pass
+                
+                if any(official_taxes[f] for f in ['aec', 'die', 'te'] if isinstance(official_taxes[f], (int, float)) and official_taxes[f] > 0):
+                    official_taxes['source'] = f'Position Matcher ({validation.get("match_type", "aproximado")})'
+                    debug_log(f"✅ Usando impuestos oficiales desde Position Matcher ({validation.get('match_type')})", official_taxes, level="SUCCESS")
+                    return official_taxes
+    
+    # FALLBACK: Datos de IA
+    ai_classification = ncm_result.get('ai_classification', {})
+    tratamiento = ai_classification.get('tratamiento_arancelario', {}) if ai_classification else ncm_result.get('tratamiento_arancelario', {})
+    
+    if tratamiento:
+        # Parsear AEC desde IA
+        derechos_str = tratamiento.get('derechos_importacion', '0.0%')
+        try:
+            cleaned_str = re.sub(r'[^\d.]', '', str(derechos_str))
+            if cleaned_str:
+                official_taxes['aec'] = float(cleaned_str)
+        except (ValueError, TypeError):
+            pass
+        
+        # Otros impuestos desde IA si están disponibles
+        if 'tasa_estadistica' in tratamiento:
+            try:
+                te_str = re.sub(r'[^\d.]', '', str(tratamiento['tasa_estadistica']))
+                if te_str:
+                    official_taxes['te'] = float(te_str)
+            except (ValueError, TypeError):
+                pass
+        
+        official_taxes['source'] = 'IA (sin datos oficiales)'
+        debug_log("⚠️ Usando impuestos desde IA (sin datos oficiales disponibles)", official_taxes, level="WARNING")
+    
+    return official_taxes
 
 def _calculate_full_landed_cost(price: float, result_session: dict) -> float:
     """Calcula el landed cost completo para un precio FOB/CIF dado, usando la configuración de la sesión."""
@@ -549,7 +676,13 @@ def _calculate_full_landed_cost(price: float, result_session: dict) -> float:
             derechos_importacion_pct=derechos_importacion_pct
         )
         
-        flete_costo = price * 0.15
+        # Usar el costo de flete unitario del resultado si está disponible
+        if 'costo_flete_usd' in result_session:
+            flete_costo = result_session['costo_flete_usd']
+        else:
+            # Fallback: estimación simple
+            flete_costo = price * 0.15
+            
         honorarios_despachante = price * 0.02
         
         return price + float(tax_result.total_impuestos) + flete_costo + honorarios_despachante
@@ -800,13 +933,38 @@ def fetch_and_populate_from_url(url):
             log_flow_step("FETCH_FROM_URL", "ERROR", {"error": str(e)})
             return
 
-    with st.spinner("🧠 Estimando dimensiones y peso con IA..."):
+    with st.spinner("🧠 Analizando dimensiones y peso (datos reales + IA)..."):
         try:
             estimator = ProductShippingEstimator()
             product_dict = product.raw_data if hasattr(product, 'raw_data') else {}
+            
+            # Usar datos reales cuando estén disponibles, IA como fallback
+            if not product_dict:
+                debug_log("No raw_data found, reconstructing for estimation", level="WARNING")
+                product_dict = {
+                    'subject': product.title,
+                    'categories': product.categories,
+                    'mediaItems': [{'type': 'image', 'imageUrl': {'big': url}} for url in product.images],
+                    'productHtmlDescription': getattr(product, 'html_description', ''),
+                    'productBasicProperties': getattr(product, 'properties_list', [])
+                }
+            
+            # Usar lógica inteligente: datos reales primero, IA como fallback
             shipping_info = estimator.get_shipping_details(product_dict)
             st.session_state.shipping_info = shipping_info
             log_flow_step("ESTIMACION_DIMENSIONES", "SUCCESS", shipping_info)
+            
+            # Mostrar método usado
+            method = shipping_info.get('method', 'unknown')
+            if method == 'extracted_validated':
+                debug_log("✅ Usando datos reales extraídos de Alibaba", shipping_info, level="SUCCESS")
+                st.success("📏 Dimensiones y peso extraídos desde datos reales de Alibaba")
+            elif method == 'llm_estimated':
+                debug_log("🧠 Usando estimación por IA (datos extraídos insuficientes)", shipping_info, level="INFO")
+                st.info("🤖 Dimensiones y peso estimados por IA (datos del producto insuficientes)")
+            else:
+                debug_log(f"⚠️ Método de estimación: {method}", shipping_info, level="WARNING")
+            
         except Exception as e:
             st.warning(f"⚠️ No se pudieron estimar las dimensiones: {e}. Se usarán valores por defecto.")
             st.session_state.shipping_info = {"method": "failed_fallback"}
@@ -844,7 +1002,7 @@ def fetch_and_populate_from_url(url):
     else:
         pde['pricing_df'] = pd.DataFrame([{"min_quantity": 1, "price_usd": 0.0}])
 
-    # Poblar dimensiones y peso desde la estimación
+    # Poblar dimensiones y peso desde la estimación - SIEMPRE usar estimaciones IA
     dims = shipping_info.get('dimensions_cm', {})
     pde['dimensions_cm'] = {
         "length": dims.get('length_cm', 0.0),
@@ -855,7 +1013,7 @@ def fetch_and_populate_from_url(url):
     pde['import_quantity'] = int(product.moq or 1)
 
     st.session_state.data_input_step_completed = True
-    st.success("✅ Datos extraídos. Revisa y ajusta los valores si es necesario antes de calcular.")
+    st.success("✅ Datos extraídos y procesados. Revisa y ajusta los valores si es necesario antes de calcular.")
     st.rerun()
 
 def render_main_calculator():
@@ -1279,28 +1437,81 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
             properties=properties_dict
         )
 
-        # Paso 1: Clasificar NCM
-        with st.spinner("🤖 Clasificando NCM con IA..."):
-            log_flow_step("CLASIFICACION_NCM_VUCE", "STARTED")
+        # Paso 1: Clasificar NCM con Integración Refinada (IA + Position Matcher)
+        with st.spinner("🤖 Clasificando NCM con integración refinada (IA + Datos Oficiales)..."):
+            log_flow_step("CLASIFICACION_NCM_INTEGRADA", "STARTED")
             ncm_result = {}
             try:
                 enhanced_description = create_enhanced_description(product_for_analysis)
                 
-                classifier = AINcmClassifier(API_KEYS.get("OPENAI_API_KEY"))
-                ncm_result = asyncio.run(classifier.classify_product(
+                # NUEVO: Usar clasificador integrado que combina IA + Position Matcher
+                integrated_classifier = IntegratedNCMClassifier(
+                    ncm_data_file=NCM_DATA_FILE,
+                    openai_api_key=API_KEYS.get("OPENAI_API_KEY")
+                )
+                
+                integrated_result = asyncio.run(integrated_classifier.classify_and_validate(
                     description=enhanced_description,
-                    image_url=editable_data['image_url']
+                    image_url=editable_data['image_url'],
+                    validate_position=True
                 ))
 
-                if "error" in ncm_result:
-                    raise ValueError(ncm_result['error'])
+                if not integrated_result.get('success'):
+                    raise ValueError(integrated_result.get('error', 'Error en clasificación integrada'))
                 
-                log_flow_step("CLASIFICACION_NCM_VUCE", "SUCCESS", {"ncm": ncm_result.get('ncm_completo')})
-                debug_log("✅ NCM clasificado exitosamente", ncm_result, level="SUCCESS")
+                # Extraer resultado para compatibilidad con el resto del flujo
+                # Priorizar datos de la recomendación final pero mantener estructura completa
+                ai_classification = integrated_result.get('ai_classification', {})
+                final_recommendation = integrated_result.get('final_recommendation', {})
+                validation_info = integrated_result.get('validation', {})
+                
+                # Crear resultado combinado manteniendo compatibilidad
+                ncm_result = {
+                    # Mantener estructura de IA para compatibilidad
+                    **ai_classification,
+                    # Agregar información de integración
+                    'final_recommendation': final_recommendation,
+                    'validation_info': validation_info,
+                    'integration_metadata': {
+                        'ai_ncm': integrated_result.get('ncm_from_ai'),
+                        'validation_type': validation_info.get('match_type'),
+                        'final_source': final_recommendation.get('source'),
+                        'confidence_final': final_recommendation.get('confidence')
+                    }
+                }
+                
+                # Logging detallado del proceso de integración
+                ai_ncm = integrated_result.get('ncm_from_ai', 'N/A')
+                validation_type = validation_info.get('match_type', 'N/A')
+                final_ncm = final_recommendation.get('recommended_ncm', 'N/A')
+                
+                log_flow_step("CLASIFICACION_NCM_INTEGRADA", "SUCCESS", {
+                    "ai_ncm": ai_ncm,
+                    "validation_type": validation_type,
+                    "final_ncm": final_ncm,
+                    "confidence": final_recommendation.get('confidence'),
+                    "source": final_recommendation.get('source')
+                })
+                
+                debug_log("✅ NCM clasificado con integración refinada", {
+                    "ia_resultado": ai_ncm,
+                    "validacion": validation_type,
+                    "ncm_final": final_ncm,
+                    "fuente": final_recommendation.get('source')
+                }, level="SUCCESS")
+                
+                # Mostrar información del proceso en la UI
+                if validation_type == 'exacto':
+                    st.success(f"🎯 NCM {final_ncm} validado con datos oficiales (match exacto)")
+                elif validation_type == 'aproximado':
+                    confidence = validation_info.get('metadata', {}).get('confidence', 0)
+                    st.info(f"📊 NCM {final_ncm} validado aproximadamente ({confidence}% confianza)")
+                else:
+                    st.info(f"🤖 NCM {final_ncm} clasificado por IA (sin validación oficial)")
 
             except Exception as e:
-                st.error(f"❌ Error en clasificación NCM: {e}")
-                log_flow_step("CLASIFICACION_NCM_VUCE", "ERROR", {"error": str(e)})
+                st.error(f"❌ Error en clasificación NCM integrada: {e}")
+                log_flow_step("CLASIFICACION_NCM_INTEGRADA", "ERROR", {"error": str(e)})
                 return
 
         # Paso 2: Calcular impuestos
@@ -1344,12 +1555,26 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
             total_volumen_cbm = volumen_unitario_cbm * import_quantity
             costo_flete_total_usd = calculate_sea_freight(total_volumen_cbm)
         
-        costo_flete_unitario_usd = costo_flete_total_usd / import_quantity
+        # Calcular costo unitario CORRECTAMENTE
+        costo_flete_unitario_usd = costo_flete_total_usd / import_quantity if import_quantity > 0 else 0
+        
+        # DEBUG: Mostrar información detallada del cálculo de flete
+        debug_log("📦 Detalles del cálculo de flete:", {
+            "peso_unitario_kg": peso_unitario_kg,
+            "cantidad_unidades": import_quantity,
+            "peso_total_kg": total_peso_kg,
+            "volumen_unitario_cbm": volumen_unitario_cbm if tipo_flete == "Marítimo (Contenedor)" else "N/A",
+            "volumen_total_cbm": total_volumen_cbm if tipo_flete == "Marítimo (Contenedor)" else "N/A",
+            "costo_flete_total_usd": costo_flete_total_usd,
+            "costo_flete_unitario_usd": costo_flete_unitario_usd,
+            "tipo_flete": tipo_flete
+        }, level="INFO")
         
         log_flow_step("CALCULO_FLETE", "SUCCESS", {
             "costo_total_flete": costo_flete_total_usd,
             "costo_unitario_flete": costo_flete_unitario_usd,
-            "cantidad_importada": import_quantity
+            "cantidad_importada": import_quantity,
+            "peso_total_kg": total_peso_kg
         })
 
         honorarios_despachante = precio_base * 0.02
@@ -1442,16 +1667,36 @@ def render_product_summary():
 def show_calculator_table():
     result = st.session_state.result
     
-    # Añadir métrica de costo total de la importación
+    # Mostrar métricas principales del análisis
     import_quantity = result['configuracion'].get('import_quantity', 1)
     landed_cost_unitario = result['landed_cost']
     costo_total_importacion = landed_cost_unitario * import_quantity
+    flete_total = result.get('flete_costo_total', result.get('costo_flete_usd', 0) * import_quantity)
     
-    st.metric(
-        label=f"Costo Total Estimado de la Importación ({import_quantity} unidades)",
-        value=f"${costo_total_importacion:,.2f} USD",
-        help="Este es el costo total de comprar y nacionalizar la cantidad de unidades especificada (Precio Base + Impuestos + Flete + Servicios) x Cantidad."
-    )
+    # Métricas principales en columnas
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        st.metric(
+            label="🎯 Landed Cost Unitario",
+            value=f"${landed_cost_unitario:.2f} USD",
+            help="Costo total por unidad incluyendo producto, impuestos, flete y servicios"
+        )
+    
+    with col2:
+        st.metric(
+            label=f"📦 Costo Total ({import_quantity} unidades)",
+            value=f"${costo_total_importacion:,.2f} USD",
+            help="Costo total de la importación completa"
+        )
+    
+    with col3:
+        st.metric(
+            label="🚚 Flete Total Calculado",
+            value=f"${flete_total:.2f} USD",
+            help="Costo total del flete internacional para toda la cantidad"
+        )
+    
     st.divider()
 
     # Crear tabs principales - Desglose detallado separado
@@ -1574,6 +1819,77 @@ def render_complete_analysis_tab(result):
         hide_index=True
     )
     
+    # NUEVA SECCIÓN: Mostrar TODOS los impuestos oficiales de la base de datos
+    st.markdown("#### 🏛️ Impuestos Oficiales de la Base de Datos")
+    st.markdown("*Datos oficiales extraídos de AFIP/VUCE cuando están disponibles*")
+    
+    # Obtener todos los impuestos oficiales
+    official_taxes = _get_all_official_taxes_from_ncm_result(result['ncm_result'])
+    
+    # Crear tabla de impuestos oficiales
+    impuestos_oficiales_data = [
+        {
+            "Impuesto": "🏛️ AEC (Arancel Externo Común)",
+            "Valor Oficial": f"{official_taxes['aec']:.1f}%" if official_taxes['aec'] > 0 else "0.0%",
+            "Fuente": official_taxes['source'],
+            "Estado": "✅ Disponible" if official_taxes['aec'] > 0 else "⚪ No definido"
+        },
+        {
+            "Impuesto": "📊 DIE (Derechos de Importación Específicos)",
+            "Valor Oficial": f"{official_taxes['die']:.1f}" if official_taxes['die'] > 0 else "0.0",
+            "Fuente": official_taxes['source'],
+            "Estado": "✅ Disponible" if official_taxes['die'] > 0 else "⚪ No definido"
+        },
+        {
+            "Impuesto": "📈 TE (Tasa Estadística)",
+            "Valor Oficial": f"{official_taxes['te']:.1f}%" if official_taxes['te'] > 0 else "0.0%",
+            "Fuente": official_taxes['source'],
+            "Estado": "✅ Disponible" if official_taxes['te'] > 0 else "⚪ No definido"
+        },
+        {
+            "Impuesto": "⚖️ IN (Intervenciones)",
+            "Valor Oficial": official_taxes['in'] if official_taxes['in'] else "Sin intervenciones",
+            "Fuente": official_taxes['source'],
+            "Estado": "✅ Definido" if official_taxes['in'] else "⚪ Sin restricciones"
+        },
+        {
+            "Impuesto": "🔢 DE (Derechos Específicos)",
+            "Valor Oficial": f"{official_taxes['de']:.2f}" if official_taxes['de'] > 0 else "0.00",
+            "Fuente": official_taxes['source'],
+            "Estado": "✅ Disponible" if official_taxes['de'] > 0 else "⚪ No definido"
+        },
+        {
+            "Impuesto": "📋 RE (Reintegros)",
+            "Valor Oficial": f"{official_taxes['re']:.2f}%" if official_taxes['re'] > 0 else "0.00%",
+            "Fuente": official_taxes['source'],
+            "Estado": "✅ Disponible" if official_taxes['re'] > 0 else "⚪ No definido"
+        }
+    ]
+    
+    df_impuestos_oficiales = pd.DataFrame(impuestos_oficiales_data)
+    
+    # Función para colorear las filas según el estado
+    def color_tax_rows(row):
+        if row['Estado'] == "✅ Disponible" or row['Estado'] == "✅ Definido":
+            return ['background-color: #d4edda; color: #155724'] * len(row)
+        else:
+            return ['background-color: #f8f9fa; color: #6c757d'] * len(row)
+    
+    st.dataframe(
+        df_impuestos_oficiales.style.apply(color_tax_rows, axis=1),
+        use_container_width=True,
+        hide_index=True
+    )
+    
+    # Mostrar información sobre la fuente de datos
+    source_icon = "🇦🇷" if "Base de Datos Oficial" in official_taxes['source'] else "🤖"
+    st.info(f"{source_icon} **Fuente de los datos:** {official_taxes['source']}")
+    
+    if official_taxes['source'] != 'Base de Datos Oficial':
+        st.warning("⚠️ **Nota:** Algunos datos provienen de estimación por IA. Para mayor precisión, se recomienda verificar en AFIP/VUCE directamente.")
+    
+    st.divider()
+    
     # Gráficos de visualización de costos
     st.markdown("#### 📊 Visualización de Costos")
 
@@ -1636,8 +1952,15 @@ def render_complete_analysis_tab(result):
             )
             
             impuestos_total_tier = float(tax_result_tier.total_impuestos)
-            # Simplificamos el flete y honorarios como un % del FOB para la tabla comparativa
-            flete_costo_estimado_tier = price * 0.15 
+            # Usar el método de flete actual de la configuración para cálculo consistente
+            if result['configuracion'].get('tipo_flete') == "Courier (Aéreo)":
+                # Para tiers, usar estimación proporcional al precio
+                flete_costo_estimado_tier = price * 0.15 
+            elif result['configuracion'].get('tipo_flete') == "Marítimo (Contenedor)":
+                # Para marítimo, el costo es más por volumen, no tanto por precio
+                flete_costo_estimado_tier = price * 0.12
+            else:
+                flete_costo_estimado_tier = price * 0.15 
             honorarios_despachante_tier = price * 0.02
             
             landed_cost_unitario_tier = price + impuestos_total_tier + flete_costo_estimado_tier + honorarios_despachante_tier
@@ -1956,6 +2279,9 @@ def recalculate_and_update_session(result, new_price, new_flete_type, selected_o
     """
     Recalcula todos los costos basados en nuevos parámetros y actualiza el estado de la sesión.
     """
+    # Importar funciones de flete
+    from freight_estimation import calculate_air_freight, calculate_sea_freight
+    
     if new_flete_type and new_flete_type != result.get("tipo_flete"):
         st.info(f"🔄 Recalculando con flete {new_flete_type}...")
     
@@ -1983,24 +2309,34 @@ def recalculate_and_update_session(result, new_price, new_flete_type, selected_o
         )
         result['tax_result'] = tax_result
         
-        # 2. Recalcular flete (depende del precio y tipo de flete)
-        flete_costo = 0.0
+        # 2. Recalcular flete considerando múltiples unidades
+        import_quantity = result['configuracion'].get('import_quantity', 1)
+        shipping_details = result.get('shipping_details', {})
+        
+        flete_costo_total = 0.0
         if new_flete_type == "Courier (Aéreo)":
-            flete_costo = new_price * 0.15
+            # Para courier, usar peso total
+            peso_unitario = shipping_details.get('weight_kg', 1.0)
+            peso_total = peso_unitario * import_quantity
+            if st.session_state.freight_rates is not None:
+                flete_costo_total = calculate_air_freight(peso_total, st.session_state.freight_rates)
+            else:
+                # Fallback: 15% del FOB total
+                flete_costo_total = new_price * import_quantity * 0.15
         elif new_flete_type == "Marítimo (Contenedor)":
-            shipping_details = result.get('shipping_details', {})
-            volumen_cbm_str = shipping_details.get('volume_cbm', '0')
-            try:
-                volumen_cbm = float(volumen_cbm_str)
-                if volumen_cbm > 0:
-                    costo_por_cbm = 90
-                    flete_costo = volumen_cbm * costo_por_cbm
-                    min_costo_maritimo = 50
-                    if flete_costo < min_costo_maritimo:
-                        flete_costo = min_costo_maritimo
-            except (ValueError, TypeError):
-                flete_costo = 0  # Fallback
+            dims = shipping_details.get('dimensions_cm', {})
+            if all(d > 0 for d in dims.values()):
+                volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000
+                volumen_total_cbm = volumen_unitario_cbm * import_quantity
+                flete_costo_total = calculate_sea_freight(volumen_total_cbm)
+            else:
+                # Fallback si no hay dimensiones válidas
+                flete_costo_total = new_price * import_quantity * 0.15
+        
+        # Calcular costo unitario
+        flete_costo = flete_costo_total / import_quantity if import_quantity > 0 else 0
         result['flete_costo'] = flete_costo
+        result['flete_costo_total'] = flete_costo_total
 
         # 3. Recalcular honorarios (dependen del precio)
         honorarios_despachante = new_price * 0.02
@@ -2308,7 +2644,19 @@ def render_detailed_breakdown_tab(result):
     Este valor se convierte en el **Valor en Aduana** sobre el cual se calculan derechos y tasas.
     """)
     
-    flete_total = flete_unitario * import_quantity
+    # Calcular flete total real considerando economías de escala
+    peso_total_kg = result['shipping_details'].get('weight_kg', 1.0) * import_quantity
+    dims = result['shipping_details'].get('dimensions_cm', {})
+    tipo_flete = result['configuracion'].get('tipo_flete', 'Courier (Aéreo)')
+    
+    if tipo_flete == "Courier (Aéreo)":
+        st.markdown(f"**Cálculo de Flete Aéreo:** Peso total = {peso_total_kg:.2f} kg")
+    elif tipo_flete == "Marítimo (Contenedor)" and all(d > 0 for d in dims.values()):
+        volumen_unitario = (dims['length'] * dims['width'] * dims['height']) / 1_000_000
+        volumen_total = volumen_unitario * import_quantity
+        st.markdown(f"**Cálculo de Flete Marítimo:** Volumen total = {volumen_total:.6f} m³")
+    
+    flete_total = result.get('flete_costo_total', flete_unitario * import_quantity)
     seguro_total = fob_total * 0.005  # 0.5% típico para seguro
     cif_total = fob_total + flete_total + seguro_total
     cif_unitario = cif_total / import_quantity

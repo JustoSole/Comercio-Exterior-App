@@ -20,6 +20,20 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
 
+def get_api_key_from_secrets(key_name: str) -> Optional[str]:
+    """Helper function to get API key from secrets or environment"""
+    try:
+        # Try loading from .streamlit/secrets.toml
+        secrets_path = os.path.join('.streamlit', 'secrets.toml')
+        if os.path.exists(secrets_path):
+            secrets = toml.load(secrets_path)
+            return secrets.get('api_keys', {}).get(key_name)
+        
+        # Fallback to environment variable
+        return os.environ.get(key_name)
+    except Exception:
+        return os.environ.get(key_name)
+
 def parse_and_convert_weight(weight_str: str) -> Optional[float]:
     """Parses a weight string (e.g., '1.5kg', '500g') and converts it to kilograms."""
     if not weight_str:
@@ -334,6 +348,7 @@ class ProductShippingEstimator:
     """
     def __init__(self, api_key: str = None):
         self.ai_estimator = AIDimensionEstimator(api_key=api_key)
+
 
     def get_shipping_details(self, product_data: Dict[str, Any]) -> Dict[str, Any]:
         """
