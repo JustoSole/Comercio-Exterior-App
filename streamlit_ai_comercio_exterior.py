@@ -19,9 +19,10 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 from decimal import Decimal
-from datetime import datetime
+from datetime import datetime, timedelta, time
+import datetime as dt_module
 import json
-import time
+import time as time_module
 import traceback
 import os
 import requests
@@ -29,6 +30,10 @@ from urllib.parse import urlparse
 import re
 import asyncio
 import io
+
+# Import para Google Sheets
+import gspread
+from google.oauth2.service_account import Credentials
 
 # Import del gestor de secrets - Usando secrets nativos de Streamlit
 def get_api_keys_dict():
@@ -72,12 +77,17 @@ os.environ['OPENAI_API_KEY'] = API_KEYS.get("OPENAI_API_KEY", "")
 # Configuración del archivo de datos NCM para integración refinada
 NCM_DATA_FILE = "pdf_reader/ncm/resultados_ncm_hybrid/dataset_ncm_HYBRID_FIXED_20250721_175449.csv"
 
+# Configuración del archivo de tarifas de flete DHL
+FREIGHT_RATES_FILE = "pdf_reader/dhl_carrier/extracted_tables.csv"
+
 # Imports de módulos reales
 try:
     from alibaba_scraper import scrape_single_alibaba_product, extract_alibaba_pricing, format_pricing_for_display, calculate_total_cost_for_option, get_cheapest_price_option
-    from integration_example import IntegratedNCMClassifier  # NUEVO: Clasificador integrado IA + Position Matcher
+    from ai_ncm_classifier import AINcmClassifier  # Sistema NCM oficial actualizado
     from import_tax_calculator import calcular_impuestos_importacion
     from product_dimension_estimator import ProductShippingEstimator
+    from dhl_freight_integration import DHLFreightService
+    # Mantener freight_estimation como fallback
     from freight_estimation import load_freight_rates, calculate_air_freight, calculate_sea_freight
     MODULES_AVAILABLE = True
 except ImportError as e:
@@ -429,7 +439,15 @@ def initialize_session_state():
     if 'current_step' not in st.session_state:
         st.session_state.current_step = None
     if 'freight_rates' not in st.session_state:
-        st.session_state.freight_rates = load_freight_rates('pdf_reader/extracted_tables.csv')
+        st.session_state.freight_rates = load_freight_rates(FREIGHT_RATES_FILE)
+    if 'dhl_service' not in st.session_state:
+        # Crear servicio DHL con callback de debug
+        st.session_state.dhl_service = DHLFreightService(
+            test_mode=True,  # Por defecto usar test mode
+            use_dhl_real=True,  # Por defecto intentar usar DHL real
+            fallback_rates_file=FREIGHT_RATES_FILE,
+            debug_callback=debug_log  # Conectar el debug
+        )
     if 'entry_mode' not in st.session_state:
         st.session_state.entry_mode = "Análisis desde URL"
     if 'product_data_editable' not in st.session_state:
@@ -452,6 +470,29 @@ def initialize_session_state():
         st.session_state.scraped_product = None
     if 'shipping_info' not in st.session_state:
         st.session_state.shipping_info = {}
+    if 'origin_details' not in st.session_state:
+        st.session_state.origin_details = {
+            "postalCode": "518000",
+            "cityName": "SHENZHEN",
+            "countryCode": "CN",
+            "addressLine1": "addres1",  # Formato que funciona con DHL test
+            "addressLine2": "addres2",
+            "addressLine3": "addres3"
+        }
+    if 'destination_details' not in st.session_state:
+        st.session_state.destination_details = {
+            "postalCode": "1440",  # Código que funciona con DHL test
+            "cityName": "CAPITAL FEDERAL",
+            "countryCode": "AR",
+            "addressLine1": "addres1",  # Formato que funciona con DHL test
+            "addressLine2": "addres2",
+            "addressLine3": "addres3"
+        }
+    if 'planned_shipping_datetime' not in st.session_state:
+        # Fecha por defecto: 3 días desde hoy a las 2 PM
+        default_datetime = datetime.now() + timedelta(days=3)
+        default_datetime = default_datetime.replace(hour=14, minute=0, second=0, microsecond=0)
+        st.session_state.planned_shipping_datetime = default_datetime
 
 def debug_log(message, data=None, level="INFO"):
     """Función de debug mejorada con nivel y categorización"""
@@ -516,146 +557,168 @@ def log_flow_step(step_name, status="STARTED", data=None):
     debug_log(f"Flow Step: {step_name} - {status}", data, level="FLOW")
 
 def _get_duties_from_ncm_result(ncm_result: dict) -> float:
-    """Extrae y parsea los derechos de importación desde el resultado de NCM (integrado o clásico)."""
+    """Extrae los derechos de importación del resultado del NCM"""
+    
     if not ncm_result:
         return 0.0
     
-    # PRIORIDAD ABSOLUTA: Datos oficiales del resultado integrado 
-    if 'final_recommendation' in ncm_result:
-        final_rec = ncm_result.get('final_recommendation', {})
-        fiscal_data = final_rec.get('fiscal_data', {})
-        
-        if 'aec' in fiscal_data:
-            try:
-                aec_value = float(fiscal_data['aec'])
-                debug_log(f"✅ Usando AEC oficial desde base de datos: {aec_value}%", level="SUCCESS")
-                return aec_value
-            except (ValueError, TypeError):
-                debug_log(f"⚠️ Error parseando AEC oficial: {fiscal_data['aec']}", level="WARNING")
-    
-    # SEGUNDA PRIORIDAD: Datos oficiales desde validation_info (Position Matcher)
-    if 'validation_info' in ncm_result:
-        validation = ncm_result.get('validation_info', {})
-        if validation.get('match_type') in ['exacto', 'aproximado']:
-            position = validation.get('position', {})
-            attributes = position.get('attributes', {})
-            
-            if 'aec' in attributes:
-                try:
-                    aec_value = float(attributes['aec'])
-                    debug_log(f"✅ Usando AEC oficial desde Position Matcher: {aec_value}%", level="SUCCESS")
-                    return aec_value
-                except (ValueError, TypeError):
-                    debug_log(f"⚠️ Error parseando AEC desde Position Matcher: {attributes['aec']}", level="WARNING")
-    
-    # TERCERA PRIORIDAD: Datos de IA (fallback)
-    ai_classification = ncm_result.get('ai_classification', {})
-    if ai_classification:
-        tratamiento = ai_classification.get('tratamiento_arancelario', {})
-        derechos_str = tratamiento.get('derechos_importacion', '0.0%')
-    else:
-        # Retrocompatibilidad: formato clásico (solo IA)
-        tratamiento = ncm_result.get('tratamiento_arancelario', {})
-        derechos_str = tratamiento.get('derechos_importacion', '0.0%')
+    # Usar datos del tratamiento arancelario del nuevo sistema integrado
+    tratamiento = ncm_result.get('tratamiento_arancelario', {})
+    derechos_str = tratamiento.get('derechos_importacion', '0.0%')
     
     try:
-        # Extrae solo los números y el punto decimal
+        import re
+        # Extraer número de la string (ej: "20.0%" -> 20.0)
         cleaned_str = re.sub(r'[^\d.]', '', str(derechos_str))
         if cleaned_str:
-            parsed_value = float(cleaned_str)
-            debug_log(f"⚠️ Usando AEC desde IA (no hay datos oficiales): {parsed_value}%", level="WARNING")
-            return parsed_value
+            return float(cleaned_str)
     except (ValueError, TypeError):
-        debug_log(f"❌ No se pudo parsear derechos de importación: '{derechos_str}'. Usando 0.0%.", level="ERROR")
+        debug_log(f"No se pudo parsear derechos de importación: '{derechos_str}'. Usando 0.0%.", level="WARNING")
     
     return 0.0
 
-def _get_all_official_taxes_from_ncm_result(ncm_result: dict) -> dict:
-    """Extrae TODOS los impuestos oficiales de la base de datos: aec, die, te, in, de, re"""
-    official_taxes = {
-        'aec': 0.0,
-        'die': 0.0, 
-        'te': 0.0,
-        'in': '',
-        'de': 0.0,
-        're': 0.0,
-        'source': 'IA'  # Indica la fuente de los datos
-    }
-    
+def _get_tasa_estadistica_from_ncm_result(ncm_result: dict) -> float:
+    """Extrae la tasa estadística del resultado del NCM"""
     if not ncm_result:
-        return official_taxes
+        return 0.0
     
-    # PRIORIDAD 1: Datos oficiales del resultado integrado
-    if 'final_recommendation' in ncm_result:
-        final_rec = ncm_result.get('final_recommendation', {})
-        fiscal_data = final_rec.get('fiscal_data', {})
-        
-        if fiscal_data:
-            for field in ['aec', 'die', 'te', 'in', 'de', 're']:
-                if field in fiscal_data:
-                    try:
-                        if field == 'in':
-                            official_taxes[field] = str(fiscal_data[field])
-                        else:
-                            official_taxes[field] = float(fiscal_data[field])
-                    except (ValueError, TypeError):
-                        pass
-            
-            if any(official_taxes[f] for f in ['aec', 'die', 'te'] if isinstance(official_taxes[f], (int, float)) and official_taxes[f] > 0):
-                official_taxes['source'] = 'Base de Datos Oficial'
-                debug_log("✅ Usando impuestos oficiales completos desde base de datos", official_taxes, level="SUCCESS")
-                return official_taxes
+    tratamiento = ncm_result.get('tratamiento_arancelario', {})
+    te_str = tratamiento.get('tasa_estadistica', '0.0%')
     
-    # PRIORIDAD 2: Position Matcher data
-    if 'validation_info' in ncm_result:
-        validation = ncm_result.get('validation_info', {})
-        if validation.get('match_type') in ['exacto', 'aproximado']:
-            position = validation.get('position', {})
-            attributes = position.get('attributes', {})
-            
-            if attributes:
-                for field in ['aec', 'die', 'te', 'in', 'de', 're']:
-                    if field in attributes:
-                        try:
-                            if field == 'in':
-                                official_taxes[field] = str(attributes[field])
-                            else:
-                                official_taxes[field] = float(attributes[field])
-                        except (ValueError, TypeError):
-                            pass
-                
-                if any(official_taxes[f] for f in ['aec', 'die', 'te'] if isinstance(official_taxes[f], (int, float)) and official_taxes[f] > 0):
-                    official_taxes['source'] = f'Position Matcher ({validation.get("match_type", "aproximado")})'
-                    debug_log(f"✅ Usando impuestos oficiales desde Position Matcher ({validation.get('match_type')})", official_taxes, level="SUCCESS")
-                    return official_taxes
+    try:
+        import re
+        cleaned_str = re.sub(r'[^\d.]', '', str(te_str))
+        if cleaned_str:
+            return float(cleaned_str)
+    except (ValueError, TypeError):
+        debug_log(f"No se pudo parsear tasa estadística: '{te_str}'. Usando 0.0%.", level="WARNING")
     
-    # FALLBACK: Datos de IA
-    ai_classification = ncm_result.get('ai_classification', {})
-    tratamiento = ai_classification.get('tratamiento_arancelario', {}) if ai_classification else ncm_result.get('tratamiento_arancelario', {})
+    return 0.0
+
+def _get_intervenciones_from_ncm_result(ncm_result: dict) -> str:
+    """Extrae las intervenciones del resultado del NCM"""
+    if not ncm_result:
+        return "Sin intervenciones"
     
-    if tratamiento:
-        # Parsear AEC desde IA
-        derechos_str = tratamiento.get('derechos_importacion', '0.0%')
-        try:
-            cleaned_str = re.sub(r'[^\d.]', '', str(derechos_str))
-            if cleaned_str:
-                official_taxes['aec'] = float(cleaned_str)
-        except (ValueError, TypeError):
-            pass
-        
-        # Otros impuestos desde IA si están disponibles
-        if 'tasa_estadistica' in tratamiento:
+    # Combinar intervenciones de múltiples fuentes
+    intervenciones_list = []
+    
+    # Intervenciones de IA
+    if ncm_result.get('intervenciones_requeridas'):
+        intervenciones_list.extend(ncm_result['intervenciones_requeridas'])
+    
+    # Intervenciones detectadas en base oficial
+    ncm_official_info = ncm_result.get('ncm_official_info', {})
+    if ncm_official_info.get('intervenciones_detectadas'):
+        intervenciones_list.extend(ncm_official_info['intervenciones_detectadas'])
+    
+    # Eliminar duplicados
+    intervenciones_unicas = list(set(intervenciones_list))
+    
+    if intervenciones_unicas:
+        return ", ".join(intervenciones_unicas)
+    else:
+        return "Sin intervenciones"
+
+def _get_all_official_taxes_from_ncm_result(ncm_result: dict) -> dict:
+    """
+    Extrae TODOS los impuestos oficiales del resultado NCM con información detallada
+    Solo incluye impuestos relevantes para IMPORTACIÓN (excluye DE y RE que son de exportación)
+    """
+    if not ncm_result:
+        return {
+            'aec': {'valor': 0.0, 'fuente': 'No disponible', 'estado': 'No definido'},
+            'die': {'valor': 0.0, 'fuente': 'No disponible', 'estado': 'No definido'},
+            'te': {'valor': 0.0, 'fuente': 'No disponible', 'estado': 'No definido'},
+            'intervenciones': {'valor': 'Sin intervenciones', 'fuente': 'IA', 'estado': 'Sin restricciones'}
+        }
+    
+    # Usar datos del tratamiento arancelario del nuevo sistema
+    tratamiento = ncm_result.get('tratamiento_arancelario', {})
+    ncm_official_info = ncm_result.get('ncm_official_info', {})
+    
+    # Determinar fuente de datos: si hay match exacto, es de la base oficial
+    is_official_data = ncm_official_info.get('match_exacto', False)
+    fuente_datos = 'Base Oficial NCM' if is_official_data else tratamiento.get('fuente', 'IA')
+    
+    # Extraer AEC (Arancel Externo Común) - el más importante
+    aec_valor = 0.0
+    if tratamiento.get('derechos_importacion'):
+        import re
+        derechos_str = str(tratamiento['derechos_importacion'])
+        # Extraer número de strings como "20.0%" o "20" 
+        cleaned_str = re.sub(r'[^\d.]', '', derechos_str)
+        if cleaned_str:
             try:
-                te_str = re.sub(r'[^\d.]', '', str(tratamiento['tasa_estadistica']))
-                if te_str:
-                    official_taxes['te'] = float(te_str)
+                aec_valor = float(cleaned_str)
             except (ValueError, TypeError):
                 pass
-        
-        official_taxes['source'] = 'IA (sin datos oficiales)'
-        debug_log("⚠️ Usando impuestos desde IA (sin datos oficiales disponibles)", official_taxes, level="WARNING")
     
-    return official_taxes
+    # Extraer TE (Tasa Estadística)
+    te_valor = 0.0
+    if tratamiento.get('tasa_estadistica'):
+        import re
+        te_str = str(tratamiento['tasa_estadistica'])
+        cleaned_str = re.sub(r'[^\d.]', '', te_str)
+        if cleaned_str:
+            try:
+                te_valor = float(cleaned_str)
+            except (ValueError, TypeError):
+                pass
+    
+    # Extraer intervenciones - combinar de múltiples fuentes
+    intervenciones_list = []
+    
+    # Intervenciones de IA
+    if ncm_result.get('intervenciones_requeridas'):
+        intervenciones_list.extend(ncm_result['intervenciones_requeridas'])
+    
+    # Intervenciones detectadas en base oficial
+    if ncm_official_info.get('intervenciones_detectadas'):
+        intervenciones_list.extend(ncm_official_info['intervenciones_detectadas'])
+    
+    # Eliminar duplicados y crear string
+    intervenciones_unicas = list(set(intervenciones_list))
+    intervenciones_valor = ", ".join(intervenciones_unicas) if intervenciones_unicas else "Sin intervenciones"
+    
+    # Construir estructura completa con SOLO impuestos de importación
+    taxes = {
+        'aec': {
+            'valor': aec_valor,
+            'fuente': fuente_datos,
+            'estado': 'Definido' if aec_valor > 0 else 'No definido'
+        },
+        'die': {
+            'valor': 0.0,  # Derechos de Importación Específicos - generalmente 0 para productos comunes
+            'fuente': fuente_datos,
+            'estado': 'No definido'
+        },
+        'te': {
+            'valor': te_valor,
+            'fuente': fuente_datos,
+            'estado': 'Definido' if te_valor > 0 else 'No definido'
+        },
+        'intervenciones': {
+            'valor': intervenciones_valor,
+            'fuente': fuente_datos,
+            'estado': 'Sin restricciones' if intervenciones_valor == "Sin intervenciones" else 'Con restricciones'
+        }
+        # REMOVIDO: DE y RE porque son de exportación, no importación
+    }
+    
+    # Debug log para verificar que los datos se están extrayendo correctamente
+    debug_log("✅ Impuestos oficiales extraídos (solo importación)", {
+        "aec_extraido": aec_valor,
+        "te_extraido": te_valor,
+        "intervenciones_count": len(intervenciones_unicas),
+        "fuente_datos": fuente_datos,
+        "match_exacto": is_official_data,
+        "tratamiento_disponible": bool(tratamiento),
+        "ncm_official_info_disponible": bool(ncm_official_info),
+        "nota": "DE y RE excluidos (son de exportación)"
+    }, level="SUCCESS")
+    
+    return taxes
 
 def _calculate_full_landed_cost(price: float, result_session: dict) -> float:
     """Calcula el landed cost completo para un precio FOB/CIF dado, usando la configuración de la sesión."""
@@ -835,7 +898,7 @@ def render_debug_tab():
             st.info("No hay logs de debug disponibles.")
     
     if auto_refresh:
-        time.sleep(2)
+        time_module.sleep(2)
         st.rerun()
 
 def render_editable_product_form():
@@ -912,6 +975,165 @@ def render_editable_product_form():
         key="import_quantity_input"
     )
     st.caption(f"El pedido mínimo (MOQ) para este producto es de {moq} unidades.")
+    
+    # Cálculos de peso y volumen para el envío
+    peso_unitario = pde.get('weight_kg', 0.0)
+    dims = pde.get('dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
+    cantidad = pde.get('import_quantity', 1)
+    
+    # Calcular peso total
+    peso_total_kg = peso_unitario * cantidad
+    
+    # Calcular volumen y peso volumétrico
+    if all(d > 0 for d in dims.values()):
+        volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000
+        volumen_total_cbm = volumen_unitario_cbm * cantidad
+        # Factor estándar para peso volumétrico aéreo: 167 kg/m³
+        peso_volumetrico_kg = volumen_total_cbm * 167
+    else:
+        volumen_total_cbm = 0
+        peso_volumetrico_kg = 0
+    
+    # Mostrar cálculos de peso y volumen
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric(
+            label="📦 Peso Total", 
+            value=f"{peso_total_kg:.2f} kg",
+            help=f"Peso físico total: {peso_unitario:.2f} kg × {cantidad} unidades"
+        )
+    
+    with col2:
+        st.metric(
+            label="📐 Peso Volumétrico", 
+            value=f"{peso_volumetrico_kg:.2f} kg" if peso_volumetrico_kg > 0 else "No calculable",
+            help=f"Peso volumétrico total: {volumen_total_cbm:.6f} m³ × 167 kg/m³ (factor aéreo estándar)"
+        )
+    
+    # Mostrar información adicional del envío
+    if volumen_total_cbm > 0:
+        col3, col4 = st.columns(2)
+        with col3:
+            st.metric(
+                label="📏 Volumen Total",
+                value=f"{volumen_total_cbm:.6f} m³",
+                help=f"Volumen total del envío: {dims['length']:.1f} × {dims['width']:.1f} × {dims['height']:.1f} cm × {cantidad} unidades"
+            )
+        
+        with col4:
+            # Determinar qué peso se usará para el flete aéreo (el mayor entre físico y volumétrico)
+            peso_facturable = max(peso_total_kg, peso_volumetrico_kg)
+            st.metric(
+                label="⚖️ Peso Facturable",
+                value=f"{peso_facturable:.2f} kg",
+                help="Para flete aéreo se cobra por el mayor entre peso real y peso volumétrico"
+            )
+        
+        # Agregar información contextual
+        if peso_volumetrico_kg > peso_total_kg:
+            st.info(f"💡 **Importante:** El peso volumétrico ({peso_volumetrico_kg:.2f} kg) es mayor al peso físico ({peso_total_kg:.2f} kg). Para flete aéreo se cobrará por el peso volumétrico.")
+        else:
+            st.info(f"💡 **Información:** El peso físico ({peso_total_kg:.2f} kg) es mayor al peso volumétrico ({peso_volumetrico_kg:.2f} kg). Para flete aéreo se cobrará por el peso físico.")
+    else:
+        st.warning("⚠️ No se puede calcular el peso volumétrico sin dimensiones válidas del producto.")
+
+    st.markdown("##### 📍 Direcciones de Envío")
+    st.caption("Configura las direcciones de origen y destino para el cálculo de flete.")
+    st.info("ℹ️ **Nota:** Solo necesitas completar código postal, ciudad y país. Por defecto: China → Argentina.")
+    
+    with st.expander("🏭 Dirección de Origen (Donde se envía)", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            origin_country = st.selectbox("País de Origen", ["CN", "US", "DE", "JP", "KR"], 
+                                        index=0, key="main_origin_country",
+                                        help="CN=China, US=USA, DE=Alemania, JP=Japón, KR=Corea")
+        
+        with col2:
+            if origin_country == "CN":
+                origin_city = st.text_input("Ciudad", value="SHENZHEN", key="main_origin_city")
+            else:
+                origin_city = st.text_input("Ciudad", value="CITY NAME", key="main_origin_city_generic")
+        
+        with col3:
+            if origin_country == "CN":
+                origin_postal = st.text_input("Código Postal", value="518000", key="main_origin_postal")
+            else:
+                origin_postal = st.text_input("Código Postal", value="00000", key="main_origin_postal_generic")
+    
+    with st.expander("🏠 Dirección de Destino (Donde llega)", expanded=False):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            dest_country = st.selectbox("País de Destino", ["AR", "US", "BR", "CL", "UY"], 
+                                      index=0, key="main_dest_country",
+                                      help="AR=Argentina, US=USA, BR=Brasil, CL=Chile, UY=Uruguay")
+        
+        with col2:
+            if dest_country == "AR":
+                dest_city = st.text_input("Ciudad", value="CAPITAL FEDERAL", key="main_dest_city")
+            else:
+                dest_city = st.text_input("Ciudad", value="CITY NAME", key="main_dest_city_generic")
+        
+        with col3:
+            if dest_country == "AR":
+                dest_postal = st.text_input("Código Postal", value="1440", key="main_dest_postal", 
+                                          help="Código que funciona con DHL test")
+            else:
+                dest_postal = st.text_input("Código Postal", value="00000", key="main_dest_postal_generic")
+    
+    # Construir objetos de direcciones simplificados usando el formato que funciona
+    origin_details = {
+        "postalCode": origin_postal,
+        "cityName": origin_city,
+        "countryCode": origin_country,
+        "addressLine1": "addres1",  # Formato compatible con DHL test
+        "addressLine2": "addres2",
+        "addressLine3": "addres3"
+    }
+    
+    destination_details = {
+        "postalCode": dest_postal,
+        "cityName": dest_city,
+        "countryCode": dest_country,
+        "addressLine1": "addres1",  # Formato compatible con DHL test
+        "addressLine2": "addres2",
+        "addressLine3": "addres3"
+    }
+    
+    # Actualizar session state con las nuevas direcciones
+    st.session_state.origin_details = origin_details
+    st.session_state.destination_details = destination_details
+    
+    st.markdown("##### 📅 Fecha de Envío")
+    st.caption("Especifica cuándo planeas enviar el producto. Si una fecha no funciona, el sistema probará fechas cercanas automáticamente.")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        # Fecha por defecto: 3 días desde hoy
+        default_date = datetime.now().date() + timedelta(days=3)
+        shipping_date = st.date_input(
+            "Fecha de Envío Planeada",
+            value=default_date,
+            min_value=datetime.now().date() + timedelta(days=1),  # Mínimo mañana
+            max_value=datetime.now().date() + timedelta(days=30), # Máximo 30 días
+            key="shipping_date_input",
+            help="Fecha en que planeas enviar el producto desde origen"
+        )
+    
+    with col2:
+        shipping_time = st.time_input(
+            "Hora de Envío Planeada",
+            value=time(14, 0),  # 2:00 PM por defecto
+            key="shipping_time_input",
+            help="Hora estimada de pickup/envío"
+        )
+    
+    # Combinar fecha y hora y guardar en session state
+    shipping_datetime = datetime.combine(shipping_date, shipping_time)
+    st.session_state.planned_shipping_datetime = shipping_datetime
+    
+    st.info(f"📅 Fecha/hora planeada: {shipping_datetime.strftime('%d/%m/%Y a las %H:%M')}")
 
 def fetch_and_populate_from_url(url):
     """Extrae datos de Alibaba y los carga en el formulario editable."""
@@ -1023,6 +1245,29 @@ def render_main_calculator():
     with st.sidebar:
         st.markdown("### ⚙️ Configuración del Cálculo")
         st.session_state.debug_mode = st.checkbox("🔧 Debug", value=True)
+        
+        # Nueva configuración DHL
+        st.markdown("#### 🚢 Configuración de Flete DHL")
+        use_real_dhl = st.checkbox("🌐 Usar DHL Real (API)", value=True, help="Si está marcado, usa la API real de DHL. Si no, usa estimaciones.")
+        dhl_test_mode = st.checkbox("🧪 Modo Test DHL", value=True, help="Usar ambiente de test de DHL (recomendado)")
+        
+
+        
+        # Actualizar configuración del servicio DHL si cambió
+        if ('dhl_use_real' not in st.session_state or 
+            st.session_state.dhl_use_real != use_real_dhl or
+            getattr(st.session_state.dhl_service, 'test_mode', None) != dhl_test_mode):
+            
+            st.session_state.dhl_use_real = use_real_dhl
+            st.session_state.dhl_service = DHLFreightService(
+                test_mode=dhl_test_mode,
+                use_dhl_real=use_real_dhl,
+                fallback_rates_file=FREIGHT_RATES_FILE,
+                debug_callback=debug_log  # Conectar el debug
+            )
+        
+        st.divider()
+        
         tipo_importador = st.selectbox("Importador:", ["responsable_inscripto", "no_inscripto", "monotributista"], key="tipo_importador_sb")
         destino_importacion = st.selectbox("Destino:", ["reventa", "uso_propio", "bien_capital"], key="destino_sb")
         provincia = st.selectbox("Provincia:", ["CABA", "BUENOS_AIRES", "CORDOBA", "SANTA_FE"], key="provincia_sb")
@@ -1061,11 +1306,11 @@ def render_main_calculator():
                 
         if config_changed:
             st.info("🔄 Detectamos un cambio en la configuración. Recalculando costos...")
-            time.sleep(1) # Pequeña pausa para que el usuario vea el mensaje
+            time_module.sleep(1) # Pequeña pausa para que el usuario vea el mensaje
             # Llamar a la función de cálculo con los nuevos parámetros.
             # Los datos del producto ya están en st.session_state.product_data_editable
             execute_landed_cost_calculation(
-                tipo_importador, destino_importacion, provincia, "oficial", cotizacion_dolar, tipo_flete
+                tipo_importador, destino_importacion, provincia, cotizacion_dolar, tipo_flete
             )
             # La función de cálculo ya hace st.rerun(), por lo que la ejecución se detendrá aquí.
 
@@ -1122,7 +1367,7 @@ def render_main_calculator():
                 st.error("❌ Completa al menos el título y un precio válido para calcular.")
             else:
                 execute_landed_cost_calculation(
-                    tipo_importador, destino_importacion, provincia, "oficial", cotizacion_dolar, tipo_flete
+                    tipo_importador, destino_importacion, provincia, cotizacion_dolar, tipo_flete
                 )
     
     # Mostrar tabla de resultados si existen
@@ -1152,13 +1397,16 @@ def main():
     """, unsafe_allow_html=True)
     
     # Crear tabs principales
-    tab1, tab2 = st.tabs(["📊 Calculadora Principal", "🔍 Debug & Análisis"])
+    tab1, tab2, tab3 = st.tabs(["📊 Calculadora Principal", "🔍 Debug & Análisis", "📊 Google Sheets Test"])
     
     with tab1:
         render_main_calculator()
     
     with tab2:
         render_debug_tab()
+    
+    with tab3:
+        render_google_sheets_test_tab()
 
 def validate_and_select_best_image(images_list, logger=None):
     """
@@ -1379,15 +1627,19 @@ def create_enhanced_description(product):
     
     return enhanced_description
 
-def execute_landed_cost_calculation(tipo_importador, destino_importacion, provincia, tipo_dolar, cotizacion_dolar, tipo_flete):
+def execute_landed_cost_calculation(tipo_importador, destino_importacion, provincia, cotizacion_dolar, tipo_flete):
     """Ejecuta el análisis de costos usando los datos del formulario editable."""
     
     editable_data = st.session_state.product_data_editable
     
+    # Obtener direcciones de envío del session state (configuradas en el sidebar)
+    origin_details = st.session_state.get('origin_details')
+    destination_details = st.session_state.get('destination_details')
+    
     log_flow_step("INICIO_ANALISIS", "STARTED", {
         "configuracion": {
             "tipo_importador": tipo_importador, "destino_importacion": destino_importacion,
-            "provincia": provincia, "tipo_dolar": tipo_dolar,
+            "provincia": provincia,
             "cotizacion_dolar": cotizacion_dolar, "tipo_flete": tipo_flete
         },
         "fuente_datos": st.session_state.entry_mode
@@ -1444,68 +1696,66 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
             try:
                 enhanced_description = create_enhanced_description(product_for_analysis)
                 
-                # NUEVO: Usar clasificador integrado que combina IA + Position Matcher
-                integrated_classifier = IntegratedNCMClassifier(
-                    ncm_data_file=NCM_DATA_FILE,
-                    openai_api_key=API_KEYS.get("OPENAI_API_KEY")
-                )
+                # NUEVO: Usar clasificador oficial NCM actualizado
+                ai_classifier = AINcmClassifier(API_KEYS.get("OPENAI_API_KEY"))
                 
-                integrated_result = asyncio.run(integrated_classifier.classify_and_validate(
+                integrated_result = asyncio.run(ai_classifier.classify_product(
                     description=enhanced_description,
-                    image_url=editable_data['image_url'],
-                    validate_position=True
+                    image_url=editable_data['image_url']
                 ))
 
-                if not integrated_result.get('success'):
-                    raise ValueError(integrated_result.get('error', 'Error en clasificación integrada'))
+                if integrated_result.get('error'):
+                    raise ValueError(integrated_result.get('error', 'Error en clasificación NCM'))
                 
-                # Extraer resultado para compatibilidad con el resto del flujo
-                # Priorizar datos de la recomendación final pero mantener estructura completa
-                ai_classification = integrated_result.get('ai_classification', {})
-                final_recommendation = integrated_result.get('final_recommendation', {})
-                validation_info = integrated_result.get('validation', {})
+                # El nuevo clasificador retorna directamente los datos estructurados
+                # integrated_result ya contiene toda la información necesaria
+                ncm_result = integrated_result
                 
-                # Crear resultado combinado manteniendo compatibilidad
-                ncm_result = {
-                    # Mantener estructura de IA para compatibilidad
-                    **ai_classification,
-                    # Agregar información de integración
-                    'final_recommendation': final_recommendation,
-                    'validation_info': validation_info,
-                    'integration_metadata': {
-                        'ai_ncm': integrated_result.get('ncm_from_ai'),
-                        'validation_type': validation_info.get('match_type'),
-                        'final_source': final_recommendation.get('source'),
-                        'confidence_final': final_recommendation.get('confidence')
-                    }
-                }
+                # Logging detallado del proceso de clasificación NCM
+                ai_ncm = ncm_result.get('ncm_completo', 'N/A')
+                confianza = ncm_result.get('confianza', 'N/A')
+                fuente_oficial = ncm_result.get('ncm_official_info', {}).get('source', 'N/A')
                 
-                # Logging detallado del proceso de integración
-                ai_ncm = integrated_result.get('ncm_from_ai', 'N/A')
-                validation_type = validation_info.get('match_type', 'N/A')
-                final_ncm = final_recommendation.get('recommended_ncm', 'N/A')
-                
-                log_flow_step("CLASIFICACION_NCM_INTEGRADA", "SUCCESS", {
-                    "ai_ncm": ai_ncm,
-                    "validation_type": validation_type,
-                    "final_ncm": final_ncm,
-                    "confidence": final_recommendation.get('confidence'),
-                    "source": final_recommendation.get('source')
+                log_flow_step("CLASIFICACION_NCM_OFICIAL", "SUCCESS", {
+                    "ncm_completo": ai_ncm,
+                    "confianza": confianza,
+                    "fuente_oficial": fuente_oficial
                 })
+                
+                # Extraer información de validación del resultado integrado
+                final_ncm = ncm_result.get('ncm_completo', 'N/A')
+                ncm_official_info = ncm_result.get('ncm_official_info', {})
+                match_exacto = ncm_official_info.get('match_exacto', False)
+                
+                # Determinar tipo de validación
+                if match_exacto:
+                    validation_type = 'exacto'
+                elif ncm_official_info.get('source'):
+                    validation_type = 'aproximado'
+                else:
+                    validation_type = 'ia_solo'
                 
                 debug_log("✅ NCM clasificado con integración refinada", {
                     "ia_resultado": ai_ncm,
                     "validacion": validation_type,
                     "ncm_final": final_ncm,
-                    "fuente": final_recommendation.get('source')
+                    "fuente": ncm_official_info.get('source', 'IA')
                 }, level="SUCCESS")
                 
                 # Mostrar información del proceso en la UI
-                if validation_type == 'exacto':
+                was_refined = ncm_result.get('ncm_official_info', {}).get('was_refined', False)
+                refinement_info = ncm_result.get('ncm_official_info', {}).get('refinement_info', {})
+                
+                if was_refined:
+                    original_code = refinement_info.get('original_code', 'N/A')
+                    total_options = refinement_info.get('total_options', 'N/A')
+                    st.success(f"🎯 NCM refinado automáticamente: {original_code} → {final_ncm}")
+                    st.info(f"💡 LLM evaluó {total_options} subcategorías y eligió la más específica")
+                elif validation_type == 'exacto':
                     st.success(f"🎯 NCM {final_ncm} validado con datos oficiales (match exacto)")
                 elif validation_type == 'aproximado':
-                    confidence = validation_info.get('metadata', {}).get('confidence', 0)
-                    st.info(f"📊 NCM {final_ncm} validado aproximadamente ({confidence}% confianza)")
+                    confidence = ncm_result.get('confianza', 'Media')
+                    st.info(f"📊 NCM {final_ncm} validado con base oficial ({confidence} confianza)")
                 else:
                     st.info(f"🤖 NCM {final_ncm} clasificado por IA (sin validación oficial)")
 
@@ -1527,7 +1777,7 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
                 tax_result = calcular_impuestos_importacion(
                     cif_value=precio_base,
                     tipo_importador=tipo_importador, destino=destino_importacion,
-                    origen="extrazona", tipo_dolar=tipo_dolar, provincia=provincia,
+                    origen="extrazona", provincia=provincia,
                     derechos_importacion_pct=derechos_importacion_pct
                 )
                 log_flow_step("CALCULO_IMPUESTOS", "SUCCESS", {"total_impuestos": float(tax_result.total_impuestos)})
@@ -1545,15 +1795,124 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
         peso_unitario_kg = float(editable_data['weight_kg'])
         dims = editable_data['dimensions_cm']
         
-        total_peso_kg = peso_unitario_kg * import_quantity
+        # Calcular pesos y volúmenes
+        peso_total_kg = peso_unitario_kg * import_quantity
+        
+        # Calcular peso volumétrico y volumen
+        volumen_unitario_cbm = 0
+        peso_volumetrico_total_kg = 0
+        if all(d > 0 for d in dims.values()):
+            volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000
+            volumen_total_cbm = volumen_unitario_cbm * import_quantity
+            peso_volumetrico_total_kg = volumen_total_cbm * 167  # Factor aéreo estándar
+        else:
+            volumen_total_cbm = 0
+            
+        # Para flete aéreo, usar el mayor entre peso físico y volumétrico
+        peso_facturable_kg = max(peso_total_kg, peso_volumetrico_total_kg) if peso_volumetrico_total_kg > 0 else peso_total_kg
 
         costo_flete_total_usd = 0
+        metodo_calculo = "Sin datos"
+        
         if tipo_flete == "Courier (Aéreo)":
-            costo_flete_total_usd = calculate_air_freight(total_peso_kg, st.session_state.freight_rates)
+            # NUEVO: Usar servicio DHL integrado con fallbacks automáticos
+            try:
+                # Construir dimensiones para DHL
+                dimensions_cm_dict = {
+                    "length": dims.get('length', 25),
+                    "width": dims.get('width', 35), 
+                    "height": dims.get('height', 15)
+                }
+                
+                # Calcular con servicio DHL integrado usando direcciones personalizadas
+                dhl_result = st.session_state.dhl_service.calculate_freight_with_fallback(
+                    weight_kg=peso_facturable_kg,
+                    dimensions_cm=dimensions_cm_dict,
+                    origin_details=origin_details,
+                    destination_details=destination_details,
+                    shipping_datetime=st.session_state.get('planned_shipping_datetime')
+                )
+                
+                # Registrar la respuesta completa en la API responses
+                if 'raw_response' in dhl_result:
+                    log_api_call("DHL_API", dimensions_cm_dict, dhl_result['raw_response'], dhl_result['success'])
+                
+                # Extraer costos detallados si están disponibles
+                insurance_cost = 0.0
+                argentina_taxes = 0.0
+                
+                if 'cost_breakdown' in dhl_result:
+                    cost_breakdown = dhl_result['cost_breakdown']
+                    insurance_cost = cost_breakdown.get('insurance_cost', 0.0)
+                    argentina_taxes = cost_breakdown.get('argentina_taxes', 0.0)
+                    
+                    debug_log(f"🛡️ Seguro incluido en DHL: ${insurance_cost:.2f} USD")
+                    debug_log(f"🏛️ Impuestos argentinos incluidos en DHL: ${argentina_taxes:.2f} USD")
+                
+                costo_flete_total_usd = dhl_result["cost_usd"]
+                metodo_calculo = f"DHL {dhl_result['method']}"
+                
+                # Logging según el método usado
+                if dhl_result["method"] == "dhl_api_real":
+                    debug_log(f"✅ Flete aéreo calculado con API real de DHL: ${costo_flete_total_usd:.2f}", level="SUCCESS")
+                    st.success(f"🌐 Cotización real de DHL: ${costo_flete_total_usd:.2f} USD")
+                    
+                    # Mostrar desglose si está disponible
+                    if 'cost_breakdown' in dhl_result:
+                        breakdown = dhl_result['cost_breakdown']
+                        st.info(f"💼 Incluye: Servicio ${breakdown.get('base_service_cost', 0):.2f} + Combustible ${breakdown.get('fuel_surcharge', 0):.2f}" +
+                               (f" + Seguro ${breakdown.get('insurance_cost', 0):.2f}" if breakdown.get('insurance_cost', 0) > 0 else "") +
+                               (f" + Impuestos AR ${breakdown.get('argentina_taxes', 0):.2f}" if breakdown.get('argentina_taxes', 0) > 0 else ""))
+                        
+                elif dhl_result["method"] == "fallback_rates":
+                    debug_log(f"✅ Flete aéreo con tarifas de fallback DHL: ${costo_flete_total_usd:.2f}", level="WARNING")
+                    st.info(f"📊 Cotización con tarifas de referencia: ${costo_flete_total_usd:.2f} USD")
+                else:
+                    debug_log(f"✅ Flete aéreo con estimación básica: ${costo_flete_total_usd:.2f}", level="WARNING")
+                    st.warning(f"📈 Cotización estimada: ${costo_flete_total_usd:.2f} USD")
+                
+                if dhl_result.get("note"):
+                    st.caption(f"ℹ️ {dhl_result['note']}")
+                    
+                # Almacenar información del seguro e impuestos para uso posterior
+                result_session_data = {
+                    'dhl_insurance_cost': insurance_cost,
+                    'dhl_argentina_taxes': argentina_taxes,
+                    'dhl_insurance_included': dhl_result.get('insurance_included', False),
+                    'dhl_taxes_included': dhl_result.get('taxes_included', False)
+                }
+                    
+            except Exception as e:
+                # Fallback final a cálculo tradicional
+                debug_log(f"❌ Error en servicio DHL integrado: {e}. Usando fallback tradicional.", level="ERROR")
+                if st.session_state.freight_rates is not None:
+                    costo_flete_total_usd = calculate_air_freight(peso_facturable_kg, st.session_state.freight_rates)
+                    metodo_calculo = "Fallback tradicional DHL Zona 5"
+                    st.warning(f"⚠️ Usando tarifas tradicionales: ${costo_flete_total_usd:.2f} USD")
+                else:
+                    costo_flete_total_usd = 0
+                    metodo_calculo = "Sin tarifas disponibles"
+                    st.error("❌ No se pudo calcular flete aéreo")
+                
+                # Sin información adicional en fallback
+                result_session_data = {
+                    'dhl_insurance_cost': 0.0,
+                    'dhl_argentina_taxes': 0.0,
+                    'dhl_insurance_included': False,
+                    'dhl_taxes_included': False
+                }
+
         elif tipo_flete == "Marítimo (Contenedor)":
-            volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000 if all(d > 0 for d in dims.values()) else 0
-            total_volumen_cbm = volumen_unitario_cbm * import_quantity
-            costo_flete_total_usd = calculate_sea_freight(total_volumen_cbm)
+            if volumen_total_cbm > 0:
+                # Usar exactamente 90 USD por m³
+                costo_flete_total_usd = volumen_total_cbm * 90.0
+                metodo_calculo = "90 USD/m³"
+                debug_log(f"✅ Flete marítimo calculado: ${costo_flete_total_usd:.2f} para {volumen_total_cbm:.6f} m³ a 90 USD/m³", level="SUCCESS")
+            else:
+                # Sin dimensiones válidas, no calcular flete marítimo
+                costo_flete_total_usd = 0
+                metodo_calculo = "Sin dimensiones válidas"
+                debug_log("❌ No se puede calcular flete marítimo sin dimensiones válidas", level="ERROR")
         
         # Calcular costo unitario CORRECTAMENTE
         costo_flete_unitario_usd = costo_flete_total_usd / import_quantity if import_quantity > 0 else 0
@@ -1562,19 +1921,26 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
         debug_log("📦 Detalles del cálculo de flete:", {
             "peso_unitario_kg": peso_unitario_kg,
             "cantidad_unidades": import_quantity,
-            "peso_total_kg": total_peso_kg,
-            "volumen_unitario_cbm": volumen_unitario_cbm if tipo_flete == "Marítimo (Contenedor)" else "N/A",
-            "volumen_total_cbm": total_volumen_cbm if tipo_flete == "Marítimo (Contenedor)" else "N/A",
+            "peso_total_kg": peso_total_kg,
+            "peso_volumetrico_total_kg": peso_volumetrico_total_kg,
+            "peso_facturable_kg": peso_facturable_kg,
+            "volumen_unitario_cbm": volumen_unitario_cbm,
+            "volumen_total_cbm": volumen_total_cbm if tipo_flete == "Marítimo (Contenedor)" else "N/A",
             "costo_flete_total_usd": costo_flete_total_usd,
             "costo_flete_unitario_usd": costo_flete_unitario_usd,
-            "tipo_flete": tipo_flete
+            "tipo_flete": tipo_flete,
+            "metodo_calculo": metodo_calculo,
+            "tarifas_disponibles": st.session_state.freight_rates is not None
         }, level="INFO")
         
         log_flow_step("CALCULO_FLETE", "SUCCESS", {
             "costo_total_flete": costo_flete_total_usd,
             "costo_unitario_flete": costo_flete_unitario_usd,
             "cantidad_importada": import_quantity,
-            "peso_total_kg": total_peso_kg
+            "peso_total_kg": peso_total_kg,
+            "peso_facturable_kg": peso_facturable_kg,
+            "volumen_total_cbm": volumen_total_cbm,
+            "metodo_calculo": metodo_calculo
         })
 
         honorarios_despachante = precio_base * 0.02
@@ -1586,11 +1952,18 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
             "ncm_result": ncm_result,
             "tax_result": tax_result,
             "costo_flete_usd": costo_flete_unitario_usd,
+            "costo_flete_total_usd": costo_flete_total_usd,
             "peso_final_kg": peso_unitario_kg, # Mantenemos el peso unitario aquí
-            "shipping_details": { # Usar los datos del formulario
+            "shipping_details": { # Usar los datos del formulario con información ampliada
                 "weight_kg": peso_unitario_kg,
+                "peso_total_kg": peso_total_kg,
+                "peso_volumetrico_total_kg": peso_volumetrico_total_kg,
+                "peso_facturable_kg": peso_facturable_kg,
                 "dimensions_cm": dims,
-                "method": "Manual" if st.session_state.entry_mode == 'Ingreso Manual' else 'Edited'
+                "volumen_unitario_cbm": volumen_unitario_cbm,
+                "volumen_total_cbm": volumen_total_cbm,
+                "method": "Manual" if st.session_state.entry_mode == 'Ingreso Manual' else 'Edited',
+                "metodo_calculo_flete": metodo_calculo
             },
             "landed_cost": landed_cost,
             "precio_base": precio_base,
@@ -1598,10 +1971,17 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
             "image_selection_info": {"selected_url": editable_data['image_url']}, # Simular para render
             "configuracion": {
                 "tipo_importador": tipo_importador, "destino_importacion": destino_importacion,
-                "provincia": provincia, "tipo_dolar": tipo_dolar,
+                "provincia": provincia,
                 "cotizacion_dolar": cotizacion_dolar, "tipo_flete": tipo_flete,
                 "honorarios_despachante": honorarios_despachante,
                 "import_quantity": import_quantity
+            },
+            # NUEVO: Información adicional de DHL
+            "dhl_details": result_session_data if 'result_session_data' in locals() else {
+                'dhl_insurance_cost': 0.0,
+                'dhl_argentina_taxes': 0.0,
+                'dhl_insurance_included': False,
+                'dhl_taxes_included': False
             }
         }
         log_flow_step("FIN_ANALISIS", "SUCCESS", {"landed_cost": landed_cost})
@@ -1671,7 +2051,8 @@ def show_calculator_table():
     import_quantity = result['configuracion'].get('import_quantity', 1)
     landed_cost_unitario = result['landed_cost']
     costo_total_importacion = landed_cost_unitario * import_quantity
-    flete_total = result.get('flete_costo_total', result.get('costo_flete_usd', 0) * import_quantity)
+    flete_total = result.get('costo_flete_total_usd', result.get('costo_flete_usd', 0) * import_quantity)
+    shipping_details = result.get('shipping_details', {})
     
     # Métricas principales en columnas
     col1, col2, col3 = st.columns(3)
@@ -1691,12 +2072,63 @@ def show_calculator_table():
         )
     
     with col3:
+        metodo_flete = shipping_details.get('metodo_calculo_flete', 'Calculado')
         st.metric(
             label="🚚 Flete Total Calculado",
             value=f"${flete_total:.2f} USD",
-            help="Costo total del flete internacional para toda la cantidad"
+            help=f"Costo total del flete internacional para toda la cantidad (Método: {metodo_flete})"
         )
     
+    # Información adicional del envío si está disponible
+    if shipping_details.get('peso_facturable_kg', 0) > 0:
+        st.markdown("#### 📊 Información del Envío")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        with col1:
+            st.metric(
+                label="⚖️ Peso Físico Total",
+                value=f"{shipping_details.get('peso_total_kg', 0):.2f} kg",
+                help="Peso real de toda la mercadería"
+            )
+        
+        with col2:
+            peso_volumetrico = shipping_details.get('peso_volumetrico_total_kg', 0)
+            if peso_volumetrico > 0:
+                st.metric(
+                    label="📐 Peso Volumétrico",
+                    value=f"{peso_volumetrico:.2f} kg",
+                    help="Peso volumétrico calculado (factor 167 kg/m³)"
+                )
+            else:
+                st.metric(
+                    label="📐 Peso Volumétrico",
+                    value="No calculable",
+                    help="No se puede calcular sin dimensiones válidas"
+                )
+        
+        with col3:
+            st.metric(
+                label="🎯 Peso Facturable",
+                value=f"{shipping_details.get('peso_facturable_kg', 0):.2f} kg",
+                help="Peso utilizado para el cálculo del flete (el mayor entre físico y volumétrico)"
+            )
+        
+        with col4:
+            volumen_total = shipping_details.get('volumen_total_cbm', 0)
+            if volumen_total > 0:
+                st.metric(
+                    label="📏 Volumen Total",
+                    value=f"{volumen_total:.6f} m³",
+                    help="Volumen total del envío"
+                )
+            else:
+                st.metric(
+                    label="📏 Volumen Total",
+                    value="No calculable",
+                    help="No se puede calcular sin dimensiones válidas"
+                )
+        
     st.divider()
 
     # Crear tabs principales - Desglose detallado separado
@@ -1710,6 +2142,161 @@ def show_calculator_table():
     
     with tab2:
         render_detailed_breakdown_tab(result)
+    
+    # Botón para exportar a Google Sheets
+    st.divider()
+    st.markdown("### 📤 Exportar a Google Sheets")
+    
+    # Preparar datos para exportar
+    export_data = prepare_export_data(result)
+    
+    # Mostrar un resumen de los datos a exportar
+    st.write("**Datos que se exportarán:**")
+    st.json(export_data)
+    
+    # Botón de exportación
+    if st.button("📤 Subir a Google Sheets", type="primary", use_container_width=True):
+        with st.spinner("Subiendo datos a Google Sheets..."):
+            if upload_to_google_sheets(export_data):
+                st.success("✅ Datos subidos correctamente a Google Sheets!")
+            else:
+                st.error("❌ Error al subir los datos a Google Sheets")
+
+def prepare_export_data(result):
+    """
+    Preparar los datos de la cotización para exportar a Google Sheets.
+    
+    Args:
+        result: Diccionario con los resultados del cálculo
+        
+    Returns:
+        dict: Datos formateados para exportar
+    """
+    # Obtener datos básicos
+    import_quantity = result['configuracion'].get('import_quantity', 1)
+    precio_unitario = result['precio_base']
+    cotizacion = result['configuracion'].get('cotizacion_dolar', 1000)
+    flete_unitario = result['costo_flete_usd']
+    honorarios_despachante = result['configuracion'].get('honorarios_despachante', 0)
+    landed_cost = result['landed_cost']
+    
+    # Obtener datos de impuestos
+    tax_result = result['tax_result']
+    derechos_importacion = 0
+    tasa_estadistica = 0
+    iva_importacion = 0
+    percepcion_iva = 0
+    percepcion_ganancias = 0
+    ingresos_brutos = 0
+    
+    # Porcentajes de impuestos
+    derechos_importacion_pct = 0
+    tasa_estadistica_pct = 0
+    iva_importacion_pct = 0
+    percepcion_iva_pct = 0
+    percepcion_ganancias_pct = 0
+    ingresos_brutos_pct = 0
+    
+    # Extraer valores de impuestos
+    for impuesto in tax_result.impuestos:
+        if impuesto.aplica:
+            nombre_lower = impuesto.nombre.lower()
+            monto = float(impuesto.monto)
+            alicuota = float(impuesto.alicuota) * 100
+            
+            if "derechos" in nombre_lower or "importacion" in nombre_lower:
+                derechos_importacion = monto
+                derechos_importacion_pct = alicuota
+            elif "estadistica" in nombre_lower:
+                tasa_estadistica = monto
+                tasa_estadistica_pct = alicuota
+            elif "iva" in nombre_lower and "adicional" not in nombre_lower:
+                iva_importacion = monto
+                iva_importacion_pct = alicuota
+            elif "adicional" in nombre_lower:
+                percepcion_iva = monto
+                percepcion_iva_pct = alicuota
+            elif "ganancias" in nombre_lower:
+                percepcion_ganancias = monto
+                percepcion_ganancias_pct = alicuota
+            elif "brutos" in nombre_lower or "iibb" in nombre_lower:
+                ingresos_brutos = monto
+                ingresos_brutos_pct = alicuota
+    
+    # Calcular totales
+    total_impuestos = float(tax_result.total_impuestos)
+    subtotal_con_impuestos = precio_unitario + total_impuestos
+    flete_total = flete_unitario * import_quantity
+    honorarios_total = honorarios_despachante * import_quantity
+    total_landed_cost = landed_cost * import_quantity
+    total_landed_cost_ars = total_landed_cost * cotizacion
+    
+    # Obtener datos de NCM
+    ncm_result = result.get('ncm_result', {})
+    ncm_code = ncm_result.get('ncm_completo', '')
+    ncm_description = ncm_result.get('ncm_descripcion', '')
+    confianza_ia = ncm_result.get('confianza', '')
+    
+    # Obtener datos de envío
+    shipping_details = result.get('shipping_details', {})
+    peso_unitario = shipping_details.get('weight_kg', 0)
+    dims = shipping_details.get('dimensions_cm', {})
+    dimensiones = f"{dims.get('length', 0)} × {dims.get('width', 0)} × {dims.get('height', 0)} cm"
+    metodo_flete = result['configuracion'].get('tipo_flete', '')
+    
+    # Obtener datos de configuración
+    tipo_importador = result['configuracion'].get('tipo_importador', '')
+    destino = result['configuracion'].get('destino_importacion', '')
+    provincia = result['configuracion'].get('provincia', '')
+    origen = result['product'].place_of_origin if hasattr(result['product'], 'place_of_origin') else ''
+    
+    # Obtener URL de imagen
+    image_url = result.get('image_selection_info', {}).get('selected_url', '')
+    
+    # Preparar datos para exportar
+    export_data = {
+        "fecha": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        "producto": result['product'].title if hasattr(result['product'], 'title') else '',
+        "imagen_url": image_url,  # La fórmula =IMAGE() se agregará en Google Sheets
+        "url_producto": result['product'].url if hasattr(result['product'], 'url') else '',
+        "cantidad": import_quantity,
+        "precio_unitario_fob": precio_unitario,
+        "subtotal_fob": precio_unitario * import_quantity,
+        "moneda": "USD",
+        "tipo_cambio": cotizacion,
+        "derechos_importacion_pct": derechos_importacion_pct,
+        "derechos_importacion": derechos_importacion,
+        "tasa_estadistica_pct": tasa_estadistica_pct,
+        "tasa_estadistica": tasa_estadistica,
+        "iva_importacion_pct": iva_importacion_pct,
+        "iva_importacion": iva_importacion,
+        "percepcion_iva_pct": percepcion_iva_pct,
+        "percepcion_iva": percepcion_iva,
+        "percepcion_ganancias_pct": percepcion_ganancias_pct,
+        "percepcion_ganancias": percepcion_ganancias,
+        "ingresos_brutos_pct": ingresos_brutos_pct,
+        "ingresos_brutos": ingresos_brutos,
+        "total_impuestos": total_impuestos,
+        "subtotal_con_impuestos": subtotal_con_impuestos,
+        "costo_flete_unitario": flete_unitario,
+        "costo_flete_total": flete_total,
+        "honorarios_despachante": honorarios_total,
+        "total_landed_cost": total_landed_cost,
+        "total_landed_cost_ars": total_landed_cost_ars,
+        "ncm": ncm_code,
+        "descripcion_ncm": ncm_description,
+        "confianza_ia": confianza_ia,
+        "peso_unitario_kg": peso_unitario,
+        "dimensiones": dimensiones,
+        "metodo_flete": metodo_flete,
+        "origen": origen,
+        "destino": destino,
+        "tipo_importador": tipo_importador,
+        "provincia": provincia,
+        "notas": ""
+    }
+    
+    return export_data
 
 def render_complete_analysis_tab(result):
     """Renderiza el análisis completo como estaba antes"""
@@ -1819,73 +2406,52 @@ def render_complete_analysis_tab(result):
         hide_index=True
     )
     
-    # NUEVA SECCIÓN: Mostrar TODOS los impuestos oficiales de la base de datos
-    st.markdown("#### 🏛️ Impuestos Oficiales de la Base de Datos")
-    st.markdown("*Datos oficiales extraídos de AFIP/VUCE cuando están disponibles*")
+    # NUEVA SECCIÓN: Mostrar impuestos oficiales de importación de la base de datos
+    st.markdown("#### 🏛️ Impuestos Oficiales de Importación")
+    st.markdown("*Datos oficiales extraídos de AFIP/VUCE para impuestos de importación únicamente*")
     
     # Obtener todos los impuestos oficiales
     official_taxes = _get_all_official_taxes_from_ncm_result(result['ncm_result'])
     
-    # Crear tabla de impuestos oficiales
+    # Crear tabla de impuestos oficiales con mejor formateo (solo importación)
     impuestos_oficiales_data = [
         {
             "Impuesto": "🏛️ AEC (Arancel Externo Común)",
-            "Valor Oficial": f"{official_taxes['aec']:.1f}%" if official_taxes['aec'] > 0 else "0.0%",
-            "Fuente": official_taxes['source'],
-            "Estado": "✅ Disponible" if official_taxes['aec'] > 0 else "⚪ No definido"
+            "Valor Oficial": f"{official_taxes['aec']['valor']:.1f}%" if official_taxes['aec']['valor'] > 0 else "0.0%",
+            "Fuente": official_taxes['aec']['fuente']
         },
         {
             "Impuesto": "📊 DIE (Derechos de Importación Específicos)",
-            "Valor Oficial": f"{official_taxes['die']:.1f}" if official_taxes['die'] > 0 else "0.0",
-            "Fuente": official_taxes['source'],
-            "Estado": "✅ Disponible" if official_taxes['die'] > 0 else "⚪ No definido"
+            "Valor Oficial": f"{official_taxes['die']['valor']:.1f}" if official_taxes['die']['valor'] > 0 else "0.0",
+            "Fuente": official_taxes['die']['fuente']
         },
         {
             "Impuesto": "📈 TE (Tasa Estadística)",
-            "Valor Oficial": f"{official_taxes['te']:.1f}%" if official_taxes['te'] > 0 else "0.0%",
-            "Fuente": official_taxes['source'],
-            "Estado": "✅ Disponible" if official_taxes['te'] > 0 else "⚪ No definido"
+            "Valor Oficial": f"{official_taxes['te']['valor']:.1f}%" if official_taxes['te']['valor'] > 0 else "0.0%",
+            "Fuente": official_taxes['te']['fuente']
         },
         {
-            "Impuesto": "⚖️ IN (Intervenciones)",
-            "Valor Oficial": official_taxes['in'] if official_taxes['in'] else "Sin intervenciones",
-            "Fuente": official_taxes['source'],
-            "Estado": "✅ Definido" if official_taxes['in'] else "⚪ Sin restricciones"
-        },
-        {
-            "Impuesto": "🔢 DE (Derechos Específicos)",
-            "Valor Oficial": f"{official_taxes['de']:.2f}" if official_taxes['de'] > 0 else "0.00",
-            "Fuente": official_taxes['source'],
-            "Estado": "✅ Disponible" if official_taxes['de'] > 0 else "⚪ No definido"
-        },
-        {
-            "Impuesto": "📋 RE (Reintegros)",
-            "Valor Oficial": f"{official_taxes['re']:.2f}%" if official_taxes['re'] > 0 else "0.00%",
-            "Fuente": official_taxes['source'],
-            "Estado": "✅ Disponible" if official_taxes['re'] > 0 else "⚪ No definido"
+            "Impuesto": "⚠️ IN (Intervenciones)",
+            "Valor Oficial": official_taxes['intervenciones']['valor'][:100] + "..." if len(official_taxes['intervenciones']['valor']) > 100 else official_taxes['intervenciones']['valor'],
+            "Fuente": official_taxes['intervenciones']['fuente']
         }
     ]
-    
+        
     df_impuestos_oficiales = pd.DataFrame(impuestos_oficiales_data)
     
-    # Función para colorear las filas según el estado
-    def color_tax_rows(row):
-        if row['Estado'] == "✅ Disponible" or row['Estado'] == "✅ Definido":
-            return ['background-color: #d4edda; color: #155724'] * len(row)
-        else:
-            return ['background-color: #f8f9fa; color: #6c757d'] * len(row)
-    
+    # Mostrar tabla sin colores
     st.dataframe(
-        df_impuestos_oficiales.style.apply(color_tax_rows, axis=1),
+        df_impuestos_oficiales,
         use_container_width=True,
         hide_index=True
     )
     
     # Mostrar información sobre la fuente de datos
-    source_icon = "🇦🇷" if "Base de Datos Oficial" in official_taxes['source'] else "🤖"
-    st.info(f"{source_icon} **Fuente de los datos:** {official_taxes['source']}")
+    fuente_principal = official_taxes['aec']['fuente']
+    source_icon = "🇦🇷" if "Base Oficial NCM" in fuente_principal else "🤖"
+    st.info(f"{source_icon} **Fuente de los datos:** {fuente_principal}")
     
-    if official_taxes['source'] != 'Base de Datos Oficial':
+    if fuente_principal != 'Base Oficial NCM':
         st.warning("⚠️ **Nota:** Algunos datos provienen de estimación por IA. Para mayor precisión, se recomienda verificar en AFIP/VUCE directamente.")
     
     st.divider()
@@ -1946,7 +2512,6 @@ def render_complete_analysis_tab(result):
                 tipo_importador=result['configuracion'].get('tipo_importador', 'responsable_inscripto'),
                 destino=result['configuracion'].get('destino_importacion', 'reventa'),
                 origen="extrazona",
-                tipo_dolar=result['configuracion'].get('tipo_dolar', 'oficial'),
                 provincia=result['configuracion'].get('provincia', 'CABA'),
                 derechos_importacion_pct=derechos_importacion_pct
             )
@@ -2061,90 +2626,109 @@ def render_complete_analysis_tab(result):
         st.dataframe(df_rentabilidad, use_container_width=True, hide_index=True)
 
     # Información de clasificación arancelaria (NCM) con datos VUCE
-    st.markdown("#### 📖 Clasificación Arancelaria (NCM) + VUCE")
+    st.markdown("#### 📖 Clasificación Arancelaria (NCM) + Base Oficial")
     
     ncm_result = result['ncm_result']
     courier_info = ncm_result.get('regimen_simplificado_courier', {})
-    vuce_info = ncm_result.get('vuce_info', {})
+    ncm_official_info = ncm_result.get('ncm_official_info', {})
     
-    # Tratamiento arancelario (ahora con datos de VUCE si están disponibles)
+    # Tratamiento arancelario (ahora con datos oficiales NCM si están disponibles)
     tratamiento = ncm_result.get('tratamiento_arancelario', {})
     intervenciones_ia = ncm_result.get('intervenciones_requeridas', [])
-    intervenciones_vuce = vuce_info.get('intervenciones_detectadas', [])
+    intervenciones_oficiales = ncm_official_info.get('intervenciones_detectadas', [])
     
-    # Combinar intervenciones de IA y VUCE
-    todas_intervenciones = list(set(intervenciones_ia + intervenciones_vuce))
+    # Combinar intervenciones de IA y base oficial
+    todas_intervenciones = list(set(intervenciones_ia + intervenciones_oficiales))
     intervenciones_str = ", ".join(todas_intervenciones) if todas_intervenciones else "Ninguna"
     
     ncm_completo = ncm_result.get('ncm_completo', 'N/A')
     
-    # Construir URL para VUCE
-    vuce_url = "about:blank" # URL vacía si no hay código
-    if ncm_completo != 'N/A':
-        ncm_code_for_url = ncm_completo.replace('.', '')
-        vuce_url = f"https://www.vuce.gob.ar/busquedaPosicion?posicion={ncm_code_for_url}&operacion=importacion&pais="
-
+    # Construir URL para consulta oficial
+    if ncm_completo and ncm_completo != "N/A":
+        # Extraer solo el código base para la URL (sin sufijo SIM)
+        # Ejemplo: "8528.72.00 100W" -> "85287200"
+        ncm_base = ncm_completo.split()[0] if ' ' in ncm_completo else ncm_completo
+        ncm_code_for_url = ncm_base.replace(".", "")
+        consulta_url = f"https://www.argentina.gob.ar/afip/nomenclador-comun-del-mercosur-ncm"
+    else:
+        consulta_url = "https://www.argentina.gob.ar/afip/nomenclador-comun-del-mercosur-ncm"
+    
     # Determinar fuente de datos
     fuente_datos = tratamiento.get('fuente', 'IA')
-    vuce_match = vuce_info.get('match_exacto', False)
+    ncm_official_match = ncm_official_info.get('match_exacto', False)
+    
+    # Información sobre refinamiento automático
+    was_refined = ncm_official_info.get('was_refined', False)
+    refinement_info = ncm_official_info.get('refinement_info', {})
     
     # Análisis de régimen simplificado
-    regime_analysis = courier_info.get('aplica_final', courier_info.get('aplica', 'N/A'))
-    regime_justification = courier_info.get('justificacion_combinada', courier_info.get('justificacion', 'No disponible'))
+    courier_regime = ncm_result.get('regimen_simplificado_courier', {})
     
     ncm_data = [
         {"Campo": "Posición NCM", "Valor": ncm_completo},
-        {"Campo": "Descripción NCM", "Valor": ncm_result.get('ncm_descripcion', vuce_info.get('descripcion_oficial', 'No disponible'))},
+        {"Campo": "Descripción NCM", "Valor": ncm_result.get('ncm_descripcion', ncm_official_info.get('descripcion_oficial', 'No disponible'))},
+        {"Campo": "Capítulo", "Valor": ncm_result.get('ncm_desglose', {}).get('capitulo', 'No disponible')},
+        {"Campo": "Partida", "Valor": ncm_result.get('ncm_desglose', {}).get('partida', 'No disponible')},
+        {"Campo": "Subpartida", "Valor": ncm_result.get('ncm_desglose', {}).get('subpartida', 'No disponible')},
         {"Campo": "Confianza de IA", "Valor": f"{ncm_result.get('confianza', 'N/A')}"},
-        {"Campo": "Fuente Datos", "Valor": f"{fuente_datos} {'🇦🇷' if vuce_match else '🤖'}"},
-        {"Campo": "Match VUCE", "Valor": "✅ Exacto" if vuce_match else "❌ No encontrado" if 'vuce_info' in ncm_result else "⚠️ No consultado"},
+        {"Campo": "Fuente Datos", "Valor": f"{fuente_datos} {'🇦🇷' if ncm_official_match else '🤖'}"},
+        {"Campo": "Match Oficial", "Valor": "✅ Exacto" if ncm_official_match else "❌ No encontrado" if 'ncm_official_info' in ncm_result else "⚠️ No consultado"},
+        {"Campo": "Refinamiento Automático", "Valor": "🎯 Sí (LLM eligió subcategoría)" if was_refined else "➡️ No necesario"},
         {"Campo": "Derechos de Importación", "Valor": f"{tratamiento.get('derechos_importacion', 'N/A')}"},
         {"Campo": "Tasa Estadística", "Valor": f"{tratamiento.get('tasa_estadistica', 'N/A')}"},
-        {"Campo": "IVA / Adicional", "Valor": f"{tratamiento.get('iva', 'N/A')} / {tratamiento.get('iva_adicional', 'N/A')}"},
+        {"Campo": "IVA", "Valor": f"{tratamiento.get('iva', 'N/A')}"},
+        {"Campo": "IVA Adicional", "Valor": f"{tratamiento.get('iva_adicional', 'N/A')}"},
         {"Campo": "Intervenciones", "Valor": intervenciones_str},
-        {"Campo": "🚚 Régimen Courier", "Valor": f"{'✅' if regime_analysis == 'Sí' else '❌' if regime_analysis == 'No' else '⚠️'} {regime_analysis}"},
-        {"Campo": "Justificación Régimen", "Valor": regime_justification[:100] + "..." if len(regime_justification) > 100 else regime_justification},
+        {"Campo": "Régimen Simplificado", "Valor": courier_regime.get('aplica', 'N/A')},
+        {"Campo": "Justificación", "Valor": ncm_result.get('justificacion_clasificacion', 'N/A')[:150] + '...' if ncm_result.get('justificacion_clasificacion') and len(ncm_result.get('justificacion_clasificacion', '')) > 150 else ncm_result.get('justificacion_clasificacion', 'N/A')}
     ]
     
-    # Añadir fecha de actualización VUCE si está disponible
-    if vuce_info.get('fecha_actualizacion'):
+    # Añadir información detallada del refinamiento si ocurrió
+    if was_refined and refinement_info:
         ncm_data.append({
-            "Campo": "Actualizado VUCE", 
-            "Valor": vuce_info['fecha_actualizacion']
+            "Campo": "Opciones Evaluadas",
+            "Valor": f"{refinement_info.get('total_options', 'N/A')} subcategorías"
+        })
+        ncm_data.append({
+            "Campo": "Posición Original",
+            "Valor": f"{refinement_info.get('original_code', 'N/A')}"
         })
     
-    df_ncm_info = pd.DataFrame(ncm_data)
-    st.dataframe(df_ncm_info.astype(str), use_container_width=True, hide_index=True)
-
-    # Enlaces y acciones
-    col1, col2 = st.columns(2)
+    # Añadir fecha de actualización oficial si está disponible
+    if ncm_official_info.get('fecha_actualizacion'):
+        ncm_data.append({
+            "Campo": "Actualizado Base Oficial",
+            "Valor": ncm_official_info['fecha_actualizacion']
+        })
     
-    with col1:
-        if ncm_completo != 'N/A':
-            st.markdown(f"<a href='{vuce_url}' target='_blank' style='text-decoration: none; color: #495057;'>🔗 Validar NCM en VUCE</a>", unsafe_allow_html=True)
+    df_ncm = pd.DataFrame(ncm_data)
+    st.dataframe(df_ncm, use_container_width=True, hide_index=True)
     
-    with col2:
-        if 'vuce_warning' in ncm_result:
-            st.warning(f"⚠️ VUCE: {ncm_result['vuce_warning']}")
-        elif vuce_match:
-            st.success("✅ Datos validados con VUCE oficial")
+    # Enlaces y validación
+    if ncm_completo and ncm_completo != "N/A":
+        st.markdown(f"<a href='{consulta_url}' target='_blank' style='text-decoration: none; color: #495057;'>🔗 Consultar NCM en Base Oficial</a>", unsafe_allow_html=True)
     
-    # Mostrar análisis detallado de régimen simplificado si está disponible
-    if 'vuce_analysis' in courier_info:
-        vuce_analysis = courier_info['vuce_analysis']
+    # Alertas y advertencias
+    if 'ncm_warning' in ncm_result:
+        st.warning(f"⚠️ NCM: {ncm_result['ncm_warning']}")
+    elif ncm_official_match:
+        st.success("✅ Datos validados con base oficial NCM")
+    
+    # Análisis específico del régimen simplificado con base oficial
+    if 'ncm_analysis' in courier_info:
+        ncm_analysis = courier_info['ncm_analysis']
+        st.subheader("🔍 Análisis de Régimen Simplificado (Base Oficial)")
+        st.markdown(f"**Aplica potencialmente:** {'✅ Sí' if ncm_analysis.get('aplica_potencialmente') else '❌ No'}")
         
-        with st.expander("📋 Análisis Detallado del Régimen Simplificado", expanded=False):
-            st.markdown("**Factores a verificar:**")
-            for factor in vuce_analysis.get('factores_a_verificar', []):
-                st.markdown(f"• {factor}")
-            
-            if vuce_analysis.get('posibles_restricciones'):
-                st.markdown("**⚠️ Posibles restricciones detectadas:**")
-                for restriccion in vuce_analysis['posibles_restricciones']:
-                    st.markdown(f"• {restriccion}")
-            
-            st.markdown(f"**Observaciones:** {vuce_analysis.get('observaciones', 'N/A')}")
-            st.markdown(f"**Capítulo NCM:** {vuce_analysis.get('capitulo_ncm', 'N/A')}")
+        for factor in ncm_analysis.get('factores_a_verificar', []):
+            st.info(f"🔍 {factor}")
+        
+        if ncm_analysis.get('posibles_restricciones'):
+            for restriccion in ncm_analysis['posibles_restricciones']:
+                st.warning(f"⚠️ {restriccion}")
+        
+        st.markdown(f"**Observaciones:** {ncm_analysis.get('observaciones', 'N/A')}")
+        st.markdown(f"**Capítulo NCM:** {ncm_analysis.get('capitulo_ncm', 'N/A')}")
 
     # Botones de acción minimalistas para exportar
     st.markdown("---")
@@ -2182,9 +2766,9 @@ def render_complete_analysis_tab(result):
             )
 
 def generate_report(result):
-    """Generar reporte completo para exportación incluyendo datos VUCE"""
+    """Generar reporte completo para exportación incluyendo datos oficiales NCM"""
     ncm_result = result['ncm_result']
-    vuce_info = ncm_result.get('vuce_info', {})
+    ncm_official_info = ncm_result.get('ncm_official_info', {})
     courier_info = ncm_result.get('regimen_simplificado_courier', {})
     
     return {
@@ -2207,13 +2791,13 @@ def generate_report(result):
             "metodo_clasificacion": ncm_result.get('classification_method'),
             "justificacion": ncm_result.get('justificacion_clasificacion'),
             "intervenciones_ia": ncm_result.get('intervenciones_requeridas', []),
-            "vuce_data": {
-                "match_exacto": vuce_info.get('match_exacto', False),
-                "descripcion_oficial": vuce_info.get('descripcion_oficial'),
-                "fecha_actualizacion_vuce": vuce_info.get('fecha_actualizacion'),
-                "intervenciones_detectadas": vuce_info.get('intervenciones_detectadas', []),
-                "warning": ncm_result.get('vuce_warning')
-            },
+                    "ncm_official_data": {
+            "match_exacto": ncm_official_info.get('match_exacto', False),
+            "descripcion_oficial": ncm_official_info.get('descripcion_oficial'),
+            "fecha_actualizacion": ncm_official_info.get('fecha_actualizacion'),
+            "intervenciones_detectadas": ncm_official_info.get('intervenciones_detectadas', []),
+            "warning": ncm_result.get('ncm_warning')
+        },
             "tratamiento_arancelario": ncm_result.get('tratamiento_arancelario', {}),
             "regimen_simplificado": {
                 "aplica_ia": courier_info.get('aplica'),
@@ -2241,8 +2825,9 @@ def generate_report(result):
             ]
         },
         "flete": {
-            "costo": result['flete_costo'],
-            "method": "estimated_15_percent_of_fob"
+            "costo": result.get('costo_flete_usd', 0),
+            "costo_total": result.get('costo_flete_total_usd', 0),
+            "method": result.get('shipping_details', {}).get('metodo_calculo_flete', 'unknown')
         },
         "estimaciones_envio": result.get('shipping_details', {}),
         "honorarios_despachante": result.get('honorarios_despachante', 0),
@@ -2262,7 +2847,6 @@ def generate_report(result):
             "tipo_importador": result['configuracion'].get('tipo_importador'),
             "destino_importacion": result['configuracion'].get('destino_importacion'),
             "provincia": result['configuracion'].get('provincia'),
-            "tipo_dolar": result['configuracion'].get('tipo_dolar'),
             "cotizacion_dolar": result['configuracion'].get('cotizacion_dolar')
         },
         "metadata": {
@@ -2279,8 +2863,12 @@ def recalculate_and_update_session(result, new_price, new_flete_type, selected_o
     """
     Recalcula todos los costos basados en nuevos parámetros y actualiza el estado de la sesión.
     """
-    # Importar funciones de flete
-    from freight_estimation import calculate_air_freight, calculate_sea_freight
+    # Mantener import de calculate_sea_freight para flete marítimo
+    from freight_estimation import calculate_sea_freight
+    
+    # Obtener direcciones de envío del session state (configuradas en el sidebar)
+    origin_details = st.session_state.get('origin_details')
+    destination_details = st.session_state.get('destination_details')
     
     if new_flete_type and new_flete_type != result.get("tipo_flete"):
         st.info(f"🔄 Recalculando con flete {new_flete_type}...")
@@ -2303,40 +2891,147 @@ def recalculate_and_update_session(result, new_price, new_flete_type, selected_o
             tipo_importador=result['configuracion'].get('tipo_importador', 'responsable_inscripto'),
             destino=result['configuracion'].get('destino_importacion', 'reventa'),
             origen="extrazona",
-            tipo_dolar=result['configuracion'].get('tipo_dolar', 'oficial'),
             provincia=result['configuracion'].get('provincia', 'CABA'),
             derechos_importacion_pct=derechos_importacion_pct
         )
         result['tax_result'] = tax_result
         
-        # 2. Recalcular flete considerando múltiples unidades
+        # 2. Recalcular flete considerando múltiples unidades usando la misma lógica mejorada
         import_quantity = result['configuracion'].get('import_quantity', 1)
         shipping_details = result.get('shipping_details', {})
         
-        flete_costo_total = 0.0
-        if new_flete_type == "Courier (Aéreo)":
-            # Para courier, usar peso total
-            peso_unitario = shipping_details.get('weight_kg', 1.0)
-            peso_total = peso_unitario * import_quantity
-            if st.session_state.freight_rates is not None:
-                flete_costo_total = calculate_air_freight(peso_total, st.session_state.freight_rates)
-            else:
-                # Fallback: 15% del FOB total
-                flete_costo_total = new_price * import_quantity * 0.15
-        elif new_flete_type == "Marítimo (Contenedor)":
-            dims = shipping_details.get('dimensions_cm', {})
-            if all(d > 0 for d in dims.values()):
-                volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000
-                volumen_total_cbm = volumen_unitario_cbm * import_quantity
-                flete_costo_total = calculate_sea_freight(volumen_total_cbm)
-            else:
-                # Fallback si no hay dimensiones válidas
-                flete_costo_total = new_price * import_quantity * 0.15
+        # Obtener datos de peso y dimensiones
+        peso_unitario = shipping_details.get('weight_kg', 1.0)
+        dims = shipping_details.get('dimensions_cm', {})
         
-        # Calcular costo unitario
-        flete_costo = flete_costo_total / import_quantity if import_quantity > 0 else 0
-        result['flete_costo'] = flete_costo
-        result['flete_costo_total'] = flete_costo_total
+        # Calcular pesos y volúmenes
+        peso_total_kg = peso_unitario * import_quantity
+        
+        # Calcular peso volumétrico y volumen
+        volumen_unitario_cbm = 0
+        peso_volumetrico_total_kg = 0
+        if all(d > 0 for d in dims.values()):
+            volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000
+            volumen_total_cbm = volumen_unitario_cbm * import_quantity
+            peso_volumetrico_total_kg = volumen_total_cbm * 167  # Factor aéreo estándar
+        else:
+            volumen_total_cbm = 0
+            
+        # Para flete aéreo, usar el mayor entre peso físico y volumétrico
+        peso_facturable_kg = max(peso_total_kg, peso_volumetrico_total_kg) if peso_volumetrico_total_kg > 0 else peso_total_kg
+        
+        flete_costo_total = 0.0
+        metodo_calculo = "Sin datos"
+        
+        if new_flete_type == "Courier (Aéreo)":
+            # NUEVO: Usar servicio DHL integrado en recálculo
+            try:
+                dimensions_cm_dict = {
+                    "length": dims.get('length', 25),
+                    "width": dims.get('width', 35), 
+                    "height": dims.get('height', 15)
+                }
+                
+                dhl_result = st.session_state.dhl_service.calculate_freight_with_fallback(
+                    weight_kg=peso_facturable_kg,
+                    dimensions_cm=dimensions_cm_dict,
+                    origin_details=origin_details,
+                    destination_details=destination_details,
+                    shipping_datetime=st.session_state.get('planned_shipping_datetime')
+                )
+                
+                # Registrar la respuesta completa en la API responses
+                if 'raw_response' in dhl_result:
+                    log_api_call("DHL_API", dimensions_cm_dict, dhl_result['raw_response'], dhl_result['success'])
+                
+                # Extraer costos detallados si están disponibles
+                insurance_cost = 0.0
+                argentina_taxes = 0.0
+                
+                if 'cost_breakdown' in dhl_result:
+                    cost_breakdown = dhl_result['cost_breakdown']
+                    insurance_cost = cost_breakdown.get('insurance_cost', 0.0)
+                    argentina_taxes = cost_breakdown.get('argentina_taxes', 0.0)
+                    
+                    debug_log(f"🛡️ Seguro incluido en DHL: ${insurance_cost:.2f} USD")
+                    debug_log(f"🏛️ Impuestos argentinos incluidos en DHL: ${argentina_taxes:.2f} USD")
+                
+                costo_flete_total_usd = dhl_result["cost_usd"]
+                metodo_calculo = f"DHL {dhl_result['method']}"
+                
+                # Logging según el método usado
+                if dhl_result["method"] == "dhl_api_real":
+                    debug_log(f"✅ Flete aéreo calculado con API real de DHL: ${costo_flete_total_usd:.2f}", level="SUCCESS")
+                    st.success(f"🌐 Cotización real de DHL: ${costo_flete_total_usd:.2f} USD")
+                    
+                    # Mostrar desglose si está disponible
+                    if 'cost_breakdown' in dhl_result:
+                        breakdown = dhl_result['cost_breakdown']
+                        st.info(f"💼 Incluye: Servicio ${breakdown.get('base_service_cost', 0):.2f} + Combustible ${breakdown.get('fuel_surcharge', 0):.2f}" +
+                               (f" + Seguro ${breakdown.get('insurance_cost', 0):.2f}" if breakdown.get('insurance_cost', 0) > 0 else "") +
+                               (f" + Impuestos AR ${breakdown.get('argentina_taxes', 0):.2f}" if breakdown.get('argentina_taxes', 0) > 0 else ""))
+                        
+                elif dhl_result["method"] == "fallback_rates":
+                    debug_log(f"✅ Flete aéreo con tarifas de fallback DHL: ${costo_flete_total_usd:.2f}", level="WARNING")
+                    st.info(f"📊 Cotización con tarifas de referencia: ${costo_flete_total_usd:.2f} USD")
+                else:
+                    debug_log(f"✅ Flete aéreo con estimación básica: ${costo_flete_total_usd:.2f}", level="WARNING")
+                    st.warning(f"📈 Cotización estimada: ${costo_flete_total_usd:.2f} USD")
+                
+                if dhl_result.get("note"):
+                    st.caption(f"ℹ️ {dhl_result['note']}")
+                    
+                # Almacenar información del seguro e impuestos para uso posterior
+                result_session_data = {
+                    'dhl_insurance_cost': insurance_cost,
+                    'dhl_argentina_taxes': argentina_taxes,
+                    'dhl_insurance_included': dhl_result.get('insurance_included', False),
+                    'dhl_taxes_included': dhl_result.get('taxes_included', False)
+                }
+                    
+            except Exception as e:
+                # Fallback final a cálculo tradicional
+                debug_log(f"❌ Error en servicio DHL integrado: {e}. Usando fallback tradicional.", level="ERROR")
+                if st.session_state.freight_rates is not None:
+                    costo_flete_total_usd = calculate_air_freight(peso_facturable_kg, st.session_state.freight_rates)
+                    metodo_calculo = "Fallback DHL Zona 5"
+                    st.warning(f"⚠️ Usando tarifas tradicionales: ${costo_flete_total_usd:.2f} USD")
+                else:
+                    costo_flete_total_usd = 0
+                    metodo_calculo = "Sin tarifas disponibles"
+                    st.error("❌ No se pudo calcular flete aéreo")
+                
+                # Sin información adicional en fallback
+                result_session_data = {
+                    'dhl_insurance_cost': 0.0,
+                    'dhl_argentina_taxes': 0.0,
+                    'dhl_insurance_included': False,
+                    'dhl_taxes_included': False
+                }
+
+        elif new_flete_type == "Marítimo (Contenedor)":
+            if volumen_total_cbm > 0:
+                # Usar exactamente 90 USD por m³
+                costo_flete_total_usd = volumen_total_cbm * 90.0
+                metodo_calculo = "90 USD/m³"
+            else:
+                costo_flete_total_usd = 0
+                metodo_calculo = "Sin dimensiones válidas"
+        
+        # Calcular costo unitario - corregir variable
+        flete_costo = costo_flete_total_usd / import_quantity if import_quantity > 0 else 0
+        result['costo_flete_usd'] = flete_costo
+        result['costo_flete_total_usd'] = costo_flete_total_usd
+        
+        # Actualizar shipping_details con los nuevos cálculos
+        result['shipping_details'].update({
+            "peso_total_kg": peso_total_kg,
+            "peso_volumetrico_total_kg": peso_volumetrico_total_kg,
+            "peso_facturable_kg": peso_facturable_kg,
+            "volumen_unitario_cbm": volumen_unitario_cbm,
+            "volumen_total_cbm": volumen_total_cbm,
+            "metodo_calculo_flete": metodo_calculo
+        })
 
         # 3. Recalcular honorarios (dependen del precio)
         honorarios_despachante = new_price * 0.02
@@ -2410,7 +3105,7 @@ def generate_excel_report(result):
     ncm_result = result['ncm_result']
     tax_result = result['tax_result']
     shipping_details = result.get('shipping_details', {})
-    vuce_info = ncm_result.get('vuce_info', {})
+    ncm_official_info = ncm_result.get('ncm_official_info', {})
     courier_info = ncm_result.get('regimen_simplificado_courier', {})
     
     row = 0
@@ -2554,8 +3249,8 @@ def generate_excel_report(result):
         ['Posición NCM', ncm_result.get('ncm_completo', 'N/A')],
         ['Descripción NCM', ncm_result.get('ncm_descripcion', 'N/A')],
         ['Confianza IA', f"{ncm_result.get('confianza', 'N/A')}"],
-        ['Match VUCE', "✅ Exacto" if vuce_info.get('match_exacto') else "❌ No encontrado"],
-        ['Fuente de Datos', f"{'🇦🇷 VUCE' if vuce_info.get('match_exacto') else '🤖 IA'}"],
+        ['Match Oficial', "✅ Exacto" if ncm_official_info.get('match_exacto') else "❌ No encontrado"],
+        ['Fuente de Datos', f"{'🇦🇷 Base Oficial NCM' if ncm_official_info.get('match_exacto') else '🤖 IA'}"],
         ['Intervenciones Requeridas', ', '.join(ncm_result.get('intervenciones_requeridas', [])) or 'Ninguna'],
         ['Régimen Courier', courier_info.get('aplica_final', 'N/A')],
         ['Justificación Régimen', courier_info.get('justificacion_combinada', 'N/A')[:200] + '...' if len(courier_info.get('justificacion_combinada', '')) > 200 else courier_info.get('justificacion_combinada', 'N/A')]
@@ -2577,7 +3272,6 @@ def generate_excel_report(result):
         ['Tipo de Importador', config.get('tipo_importador', 'N/A')],
         ['Destino de Importación', config.get('destino_importacion', 'N/A')],
         ['Provincia', config.get('provincia', 'N/A')],
-        ['Tipo de Dólar', config.get('tipo_dolar', 'N/A')],
         ['Cotización USD/ARS', f"${config.get('cotizacion_dolar', 0):.2f}"],
         ['Fuente de Datos', st.session_state.entry_mode],
         ['Sistema', 'AI Comercio Exterior v3.1']
@@ -2838,6 +3532,577 @@ Tasa Estadística = ${cif_total:.2f} × {tasa_estadistica_alicuota:.1f}% = ${tas
 def render_executive_summary_tab(result):
     # Aquí puedes agregar el contenido de la tab de resumen ejecutivo
     pass
+
+def validate_and_clean_json_credentials(credentials_raw):
+    """
+    Valida y limpia las credenciales JSON de Google Service Account.
+    
+    Args:
+        credentials_raw: String crudo del JSON de credenciales
+        
+    Returns:
+        dict: JSON parseado y validado, o None si hay error
+    """
+    try:
+        import re
+        
+        # Limpiar caracteres de control inválidos excepto \n, \r, \t
+        credentials_clean = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', credentials_raw)
+        
+        # Remover espacios en blanco al inicio y final
+        credentials_clean = credentials_clean.strip()
+        
+        # Intentar parsear el JSON
+        credentials_json = json.loads(credentials_clean)
+        
+        # Validar campos requeridos
+        required_fields = ["type", "project_id", "private_key", "client_email"]
+        missing_fields = [field for field in required_fields if field not in credentials_json]
+        
+        if missing_fields:
+            raise ValueError(f"Faltan campos requeridos: {missing_fields}")
+        
+        # Validar que sea un service account
+        if credentials_json.get("type") != "service_account":
+            raise ValueError("El tipo de credencial debe ser 'service_account'")
+        
+        return credentials_json
+        
+    except json.JSONDecodeError as e:
+        raise ValueError(f"JSON inválido: {e}")
+    except Exception as e:
+        raise ValueError(f"Error validando credenciales: {e}")
+
+def get_gspread_client():
+    """Obtener cliente de Google Sheets usando las credenciales del secrets."""
+    try:
+        # Obtener las credenciales del secrets
+        credentials_raw = st.secrets["google_service_account"]["credentials"]
+        
+        # Validar y limpiar las credenciales
+        try:
+            credentials_json = validate_and_clean_json_credentials(credentials_raw)
+        except ValueError as validation_error:
+            st.error(f"Error en las credenciales de Google Sheets: {validation_error}")
+            st.error("Verifica que el JSON de credenciales en secrets.toml esté bien formateado")
+            
+            # Mostrar información de debug si estamos en modo debug
+            if st.secrets.get("settings", {}).get("DEBUG_MODE", False):
+                st.error(f"JSON problemático (primeros 200 chars): {credentials_raw[:200]}...")
+            
+            return None
+        
+        # Definir los scopes necesarios
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ]
+        
+        # Crear las credenciales
+        credentials = Credentials.from_service_account_info(credentials_json, scopes=scopes)
+        
+        # Crear el cliente de gspread
+        gc = gspread.authorize(credentials)
+        
+        return gc
+        
+    except KeyError as e:
+        st.error(f"No se encontraron las credenciales de Google Sheets en secrets: {e}")
+        st.error("Asegúrate de configurar 'google_service_account.credentials' en .streamlit/secrets.toml")
+        return None
+    except Exception as e:
+        st.error(f"Error al conectar con Google Sheets: {e}")
+        
+        # Mostrar más detalles del error en modo debug
+        if st.secrets.get("settings", {}).get("DEBUG_MODE", False):
+            st.error(f"Detalles del error: {traceback.format_exc()}")
+        
+        return None
+
+def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
+    """
+    Subir datos a Google Sheets.
+    
+    Args:
+        data_dict: Diccionario con los datos de la cotización
+        worksheet_name: Nombre de la hoja de cálculo
+        
+    Returns:
+        bool: True si se subió correctamente, False en caso de error
+    """
+    try:
+        # Obtener el cliente de Google Sheets
+        gc = get_gspread_client()
+        if not gc:
+            st.error("❌ No se pudo obtener el cliente de Google Sheets")
+            return False
+        
+        # Abrir o crear la hoja de cálculo
+        try:
+            sh = create_or_open_spreadsheet(gc, worksheet_name)
+            st.info(f"📊 Conectado a la hoja: {worksheet_name}")
+        except Exception as sheet_error:
+            st.error(f"❌ Error al acceder/crear la hoja '{worksheet_name}': {sheet_error}")
+            return False
+        
+        # Seleccionar la primera hoja
+        worksheet = sh.sheet1
+        
+        # Convertir los datos a formato de fila
+        row_data = [
+            data_dict.get("fecha", ""),
+            data_dict.get("producto", ""),
+            "",  # Espacio para la imagen, se actualizará después con la fórmula
+            data_dict.get("url_producto", ""),
+            data_dict.get("cantidad", ""),
+            data_dict.get("precio_unitario_fob", ""),
+            data_dict.get("subtotal_fob", ""),
+            data_dict.get("moneda", ""),
+            data_dict.get("tipo_cambio", ""),
+            data_dict.get("derechos_importacion_pct", ""),
+            data_dict.get("derechos_importacion", ""),
+            data_dict.get("tasa_estadistica_pct", ""),
+            data_dict.get("tasa_estadistica", ""),
+            data_dict.get("iva_importacion_pct", ""),
+            data_dict.get("iva_importacion", ""),
+            data_dict.get("percepcion_iva_pct", ""),
+            data_dict.get("percepcion_iva", ""),
+            data_dict.get("percepcion_ganancias_pct", ""),
+            data_dict.get("percepcion_ganancias", ""),
+            data_dict.get("ingresos_brutos_pct", ""),
+            data_dict.get("ingresos_brutos", ""),
+            data_dict.get("total_impuestos", ""),
+            data_dict.get("subtotal_con_impuestos", ""),
+            data_dict.get("costo_flete_unitario", ""),
+            data_dict.get("costo_flete_total", ""),
+            data_dict.get("honorarios_despachante", ""),
+            data_dict.get("total_landed_cost", ""),
+            data_dict.get("total_landed_cost_ars", ""),
+            data_dict.get("ncm", ""),
+            data_dict.get("descripcion_ncm", ""),
+            data_dict.get("confianza_ia", ""),
+            data_dict.get("peso_unitario_kg", ""),
+            data_dict.get("dimensiones", ""),
+            data_dict.get("metodo_flete", ""),
+            data_dict.get("origen", ""),
+            data_dict.get("destino", ""),
+            data_dict.get("tipo_importador", ""),
+            data_dict.get("provincia", ""),
+            data_dict.get("notas", "")
+        ]
+        
+        # Verificar si ya existen encabezados
+        headers_exist = False
+        try:
+            first_cell = worksheet.cell(1, 1).value
+            if first_cell == "Fecha":
+                headers_exist = True
+        except:
+            pass
+        
+        # Si no existen encabezados, agregarlos primero
+        if not headers_exist:
+            headers = [
+                "Fecha", "Producto", "Imagen", "URL", "Cantidad", "Precio Unitario FOB", "Subtotal FOB",
+                "Moneda", "Tipo de Cambio", "Derechos de Importación %", "Derechos de Importación",
+                "Tasa Estadística %", "Tasa Estadística", "IVA Importación %", "IVA Importación",
+                "Percepción IVA %", "Percepción IVA", "Percepción Ganancias %", "Percepción Ganancias",
+                "Ingresos Brutos %", "Ingresos Brutos", "Total Impuestos", "Subtotal con Impuestos",
+                "Costo Flete Unitario", "Costo Flete Total", "Honorarios Despachante", "Total Landed Cost",
+                "Total Landed Cost ARS", "NCM", "Descripción NCM", "Confianza IA %", "Peso Unitario (kg)",
+                "Dimensiones (L×W×H cm)", "Método Flete", "Origen", "Destino", "Tipo Importador", "Provincia", "Notas"
+            ]
+            worksheet.append_row(headers)
+        
+        # Agregar los datos
+        try:
+            worksheet.append_row(row_data)
+            st.success("✅ Datos agregados exitosamente a la hoja")
+        except Exception as data_error:
+            st.error(f"❌ Error al agregar datos: {data_error}")
+            return False
+        
+        # Actualizar la fórmula de imagen en la última fila agregada
+        # La imagen está en la columna C (índice 3)
+        try:
+            if data_dict.get("imagen_url", ""):
+                # Obtener el número de la última fila
+                num_rows = worksheet.row_count
+                # Actualizar la celda con la fórmula IMAGE
+                image_formula = f'=IMAGE("{data_dict.get("imagen_url", "")}")'
+                worksheet.update(f'C{num_rows}', image_formula)
+                st.info("✅ Fórmula de imagen agregada")
+        except Exception as image_error:
+            st.warning(f"⚠️ No se pudo agregar la imagen: {image_error}")
+            # No retornar False aquí porque los datos principales ya se subieron
+        
+        # Obtener la URL de la hoja para mostrarla al usuario
+        try:
+            sheet_url = sh.url
+            st.info(f"📋 Ver hoja: {sheet_url}")
+        except:
+            pass
+        
+        return True
+    except Exception as e:
+        st.error(f"❌ Error general al subir datos a Google Sheets: {e}")
+        
+        # Mostrar más detalles del error en modo debug
+        if st.secrets.get("settings", {}).get("DEBUG_MODE", False):
+            st.error(f"Detalles del error: {traceback.format_exc()}")
+        
+        return False
+
+def test_google_sheets_connection():
+    """
+    Función de prueba para verificar la conexión a Google Sheets y subir datos de ejemplo.
+    
+    Returns:
+        bool: True si la prueba fue exitosa, False en caso contrario
+    """
+    try:
+        st.info("🔄 Iniciando prueba de conexión a Google Sheets...")
+        
+        # Obtener el cliente de Google Sheets
+        gc = get_gspread_client()
+        if not gc:
+            st.error("❌ No se pudo obtener el cliente de Google Sheets")
+            return False
+        
+        st.success("✅ Cliente de Google Sheets obtenido correctamente")
+        
+        # Nombre de la hoja de prueba (usando la hoja existente del usuario)
+        test_sheet_name = "Cotizaciones APP IA"
+        
+        # Intentar abrir la hoja, si no existe, crearla
+        try:
+            sh = gc.open(test_sheet_name)
+            st.info(f"📊 Hoja '{test_sheet_name}' encontrada")
+        except gspread.SpreadsheetNotFound:
+            st.info(f"📊 Creando nueva hoja '{test_sheet_name}'...")
+            sh = gc.create(test_sheet_name)
+            # Hacer la hoja pública para que puedas verla
+            sh.share('', perm_type='anyone', role='reader')
+            st.success(f"✅ Hoja '{test_sheet_name}' creada exitosamente")
+        
+        # Obtener la primera worksheet
+        worksheet = sh.sheet1
+        
+        # Limpiar la hoja y agregar encabezados de prueba
+        worksheet.clear()
+        
+        headers = [
+            "Timestamp", "Producto", "Precio FOB", "NCM", "Total Impuestos", 
+            "Landed Cost", "Estado", "Origen", "Destino"
+        ]
+        
+        worksheet.append_row(headers)
+        st.success("✅ Encabezados agregados")
+        
+        # Datos de prueba
+        test_data = [
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "Producto de Prueba - Smartphone",
+            "$150.00",
+            "8517.12.00",
+            "$45.30",
+            "$195.30",
+            "Prueba Exitosa",
+            "China",
+            "Argentina"
+        ]
+        
+        # Subir datos de prueba
+        worksheet.append_row(test_data)
+        st.success("✅ Datos de prueba subidos exitosamente")
+        
+        # Obtener la URL de la hoja para mostrarla al usuario
+        sheet_url = sh.url
+        st.success(f"🎉 Prueba completada exitosamente!")
+        st.info(f"📋 Puedes ver la hoja aquí: {sheet_url}")
+        
+        return True
+        
+    except Exception as e:
+        st.error(f"❌ Error durante la prueba: {e}")
+        
+        # Mostrar más detalles del error en modo debug
+        if st.secrets.get("settings", {}).get("DEBUG_MODE", False):
+            st.error(f"Detalles del error: {traceback.format_exc()}")
+        
+        return False
+
+def create_or_open_spreadsheet(gc, spreadsheet_name):
+    """
+    Abre una hoja de cálculo existente o crea una nueva si no existe.
+    
+    Args:
+        gc: Cliente de gspread
+        spreadsheet_name: Nombre de la hoja de cálculo
+        
+    Returns:
+        gspread.Spreadsheet: La hoja de cálculo
+    """
+    try:
+        # Intentar abrir la hoja existente
+        sh = gc.open(spreadsheet_name)
+        st.info(f"📊 Hoja existente '{spreadsheet_name}' encontrada")
+        return sh
+    except gspread.SpreadsheetNotFound:
+        # Si no existe, intentar crear una nueva
+        try:
+            st.info(f"📊 Creando nueva hoja '{spreadsheet_name}'...")
+            sh = gc.create(spreadsheet_name)
+            # Hacer la hoja accesible
+            sh.share('', perm_type='anyone', role='reader')
+            st.success(f"✅ Hoja '{spreadsheet_name}' creada exitosamente")
+            return sh
+        except gspread.exceptions.APIError as api_error:
+            if "quota has been exceeded" in str(api_error).lower():
+                st.error("🚨 **ERROR DE CUOTA DE GOOGLE DRIVE**")
+                st.error("La cuenta de Google Drive está llena. Soluciones:")
+                st.markdown("""
+                **Opciones para resolver esto:**
+                1. **Liberar espacio**: Ve a [Google Drive](https://drive.google.com) y elimina archivos innecesarios
+                2. **Usar otra cuenta**: Crea un nuevo Service Account con una cuenta de Google diferente
+                3. **Usar hoja existente**: En lugar de crear nueva, usa una hoja que ya exista
+                
+                **Para crear una hoja manualmente:**
+                1. Ve a [Google Sheets](https://sheets.google.com)
+                2. Crea una nueva hoja llamada exactamente: `{spreadsheet_name}`
+                3. Comparte la hoja con: `{gc.auth.service_account_email if hasattr(gc.auth, 'service_account_email') else 'el service account email'}`
+                4. Dale permisos de Editor
+                """)
+                raise Exception(f"Cuota de Drive excedida. No se puede crear la hoja '{spreadsheet_name}'")
+            else:
+                st.error(f"❌ Error de API de Google: {api_error}")
+                raise
+    except Exception as e:
+        st.error(f"❌ Error general al acceder/crear la hoja: {e}")
+        raise
+
+def render_google_sheets_test_tab():
+    """Renderiza la tab de prueba de Google Sheets"""
+    st.markdown("### 📊 Google Sheets - Pruebas y Configuración")
+    
+    st.markdown("""
+    Esta sección te permite probar la conexión a Google Sheets y verificar que todo funcione correctamente.
+    """)
+    
+    # Estado de la configuración
+    st.markdown("#### 🔧 Estado de la Configuración")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Verificar credenciales
+        try:
+            credentials_raw = st.secrets["google_service_account"]["credentials"]
+            credentials_json = validate_and_clean_json_credentials(credentials_raw)
+            st.success("✅ Credenciales de Google válidas")
+            st.info(f"📧 Service Account: {credentials_json.get('client_email', 'N/A')}")
+            st.info(f"📋 Proyecto: {credentials_json.get('project_id', 'N/A')}")
+        except Exception as e:
+            st.error(f"❌ Error en credenciales: {e}")
+    
+    with col2:
+        # Estado del cliente
+        try:
+            gc = get_gspread_client()
+            if gc:
+                st.success("✅ Cliente de Google Sheets conectado")
+            else:
+                st.error("❌ No se pudo conectar a Google Sheets")
+        except Exception as e:
+            st.error(f"❌ Error de conexión: {e}")
+    
+    st.divider()
+    
+    # Sección de pruebas
+    st.markdown("#### 🧪 Pruebas de Funcionalidad")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        if st.button("🔗 Probar Conexión Básica", type="primary", use_container_width=True):
+            test_google_sheets_connection()
+    
+    with col2:
+        if st.button("🗑️ Limpiar Resultados", use_container_width=True):
+            # Limpiar cualquier mensaje de estado anterior
+            st.rerun()
+    
+    st.divider()
+    
+    # Sección de datos de prueba personalizados
+    st.markdown("#### 🎯 Subir Datos de Prueba Personalizados")
+    
+    with st.form("test_data_form"):
+        st.markdown("Completa los datos para hacer una prueba personalizada:")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            producto = st.text_input("Producto", value="Smartphone de Prueba")
+            precio_fob = st.number_input("Precio FOB (USD)", value=150.0, min_value=0.0)
+            ncm = st.text_input("NCM", value="8517.12.00")
+            origen = st.selectbox("Origen", ["China", "Estados Unidos", "Alemania", "Japón"], index=0)
+        
+        with col2:
+            cantidad = st.number_input("Cantidad", value=1, min_value=1)
+            total_impuestos = st.number_input("Total Impuestos (USD)", value=45.0, min_value=0.0)
+            destino = st.selectbox("Destino", ["Argentina", "Uruguay", "Chile", "Brasil"], index=0)
+            notas = st.text_area("Notas", value="Datos de prueba generados desde la app")
+        
+        submitted = st.form_submit_button("📤 Subir Datos de Prueba", type="primary", use_container_width=True)
+        
+        if submitted:
+            # Crear diccionario de datos de prueba
+            test_data = {
+                "fecha": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "producto": producto,
+                "url_producto": "https://example.com/test-product",
+                "cantidad": cantidad,
+                "precio_unitario_fob": f"${precio_fob}",
+                "subtotal_fob": f"${precio_fob * cantidad}",
+                "moneda": "USD",
+                "tipo_cambio": "1200",
+                "derechos_importacion_pct": "35%",
+                "derechos_importacion": f"${precio_fob * 0.35}",
+                "tasa_estadistica_pct": "3%",
+                "tasa_estadistica": f"${precio_fob * 0.03}",
+                "iva_importacion_pct": "21%",
+                "iva_importacion": f"${precio_fob * 0.21}",
+                "percepcion_iva_pct": "10%",
+                "percepcion_iva": f"${precio_fob * 0.10}",
+                "percepcion_ganancias_pct": "5%",
+                "percepcion_ganancias": f"${precio_fob * 0.05}",
+                "ingresos_brutos_pct": "2%",
+                "ingresos_brutos": f"${precio_fob * 0.02}",
+                "total_impuestos": f"${total_impuestos}",
+                "subtotal_con_impuestos": f"${precio_fob + total_impuestos}",
+                "costo_flete_unitario": "$25.00",
+                "costo_flete_total": f"${25 * cantidad}",
+                "honorarios_despachante": "$100.00",
+                "total_landed_cost": f"${precio_fob + total_impuestos + (25 * cantidad) + 100}",
+                "total_landed_cost_ars": f"${(precio_fob + total_impuestos + (25 * cantidad) + 100) * 1200}",
+                "ncm": ncm,
+                "descripcion_ncm": "Descripción automática del NCM",
+                "confianza_ia": "85%",
+                "peso_unitario_kg": "0.5",
+                "dimensiones": "15×7×1 cm",
+                "metodo_flete": "Express",
+                "origen": origen,
+                "destino": destino,
+                "tipo_importador": "Persona Física",
+                "provincia": "Buenos Aires",
+                "notas": notas,
+                "imagen_url": "https://example.com/image.jpg"
+            }
+            
+            # Intentar subir los datos
+            with st.spinner("Subiendo datos de prueba..."):
+                if upload_to_google_sheets(test_data, "Cotizaciones APP IA"):
+                    st.success("🎉 ¡Datos de prueba subidos exitosamente!")
+                else:
+                    st.error("❌ Error al subir los datos de prueba")
+    
+    st.divider()
+    
+    # Información útil
+    st.markdown("#### 📋 Información Útil")
+    st.info("""
+    **Consejos para usar Google Sheets:**
+    
+    1. **Permisos**: Asegúrate de que el Service Account tenga permisos para crear y editar hojas
+    2. **Nombres**: Los nombres de las hojas son sensibles a mayúsculas y minúsculas  
+    3. **Límites**: Google Sheets tiene límites de velocidad - no hagas muchas requests muy rápido
+    4. **Formato**: Las fechas y números se formatean automáticamente según la configuración regional
+    
+    **En caso de problemas:**
+    - Verifica que las credenciales en `secrets.toml` sean correctas
+    - Asegúrate de que el Service Account tenga los scopes necesarios
+    - Revisa que el proyecto de Google Cloud tenga la API de Sheets habilitada
+    """)
+    
+    # Sección especial para problemas de cuota
+    st.markdown("#### 🚨 Solución para Error de Cuota de Drive")
+    
+    with st.expander("Si ves 'Drive storage quota has been exceeded' - HAZ CLIC AQUÍ"):
+        st.markdown("""
+        ### 🔧 **Problema de Cuota Excedida - Solución Paso a Paso**
+        
+        **El problema:** La cuenta de Google Drive del Service Account está llena.
+        
+        **Solución Rápida (Recomendada):**
+        
+                 1. **Crea una hoja manualmente:**
+            - Ve a [Google Sheets](https://sheets.google.com)
+            - Crea una nueva hoja
+            - Nómbrala exactamente: `Cotizaciones APP IA`
+        
+        2. **Comparte la hoja:**
+           - Haz clic en "Compartir" (botón azul)
+           - Agrega este email: `b3consulting@b3consulting.iam.gserviceaccount.com`
+           - Dale permisos de **Editor**
+           - Haz clic en "Enviar"
+        
+        3. **Prueba la conexión:**
+           - Regresa aquí y haz clic en "🔗 Probar Conexión Básica"
+           - Ahora debería funcionar correctamente
+        
+        **Otras soluciones:**
+        - **Liberar espacio**: Ve a [Google Drive](https://drive.google.com) y elimina archivos
+        - **Crear nuevo Service Account**: Con una cuenta de Google diferente
+        """)
+        
+        # Botón directo para crear hoja
+        st.markdown("**🚀 Enlaces Directos:**")
+        col1, col2 = st.columns(2)
+        with col1:
+            st.link_button("📊 Crear Nueva Hoja", "https://sheets.google.com", use_container_width=True)
+        with col2:
+            st.link_button("🗂️ Ir a Google Drive", "https://drive.google.com", use_container_width=True)
+    
+    # Prueba con hoja existente
+    st.markdown("#### 🔄 Probar con Hoja Existente")
+    
+    with st.form("existing_sheet_form"):
+        st.markdown("Si ya tienes una hoja creada, puedes probarla aquí:")
+        
+        sheet_name = st.text_input(
+            "Nombre de la hoja existente", 
+            value="Cotizaciones APP IA",
+            help="El nombre debe coincidir exactamente con el de Google Sheets"
+        )
+        
+        if st.form_submit_button("🔗 Probar Hoja Existente", type="secondary", use_container_width=True):
+            with st.spinner(f"Probando conexión con '{sheet_name}'..."):
+                try:
+                    gc = get_gspread_client()
+                    if gc:
+                        sh = gc.open(sheet_name)
+                        st.success(f"✅ ¡Conexión exitosa con '{sheet_name}'!")
+                        st.info(f"📋 URL de la hoja: {sh.url}")
+                        
+                        # Intentar escribir datos de prueba
+                        worksheet = sh.sheet1
+                        test_data = [
+                            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "Producto de Prueba",
+                            "$100.00",
+                            "Test exitoso desde la app"
+                        ]
+                        worksheet.append_row(test_data)
+                        st.success("✅ Datos de prueba agregados exitosamente")
+                        
+                    else:
+                        st.error("❌ No se pudo obtener el cliente de Google Sheets")
+                except gspread.SpreadsheetNotFound:
+                    st.error(f"❌ No se encontró una hoja llamada '{sheet_name}'")
+                    st.info("Verifica que el nombre sea exacto y que la hoja esté compartida con el Service Account")
+                except Exception as e:
+                    st.error(f"❌ Error: {e}")
 
 if __name__ == "__main__":
     main() 

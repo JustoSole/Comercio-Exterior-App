@@ -8,12 +8,13 @@ con códigos NCM/HS usando imágenes y descripciones.
 
 Funcionalidades:
 - Análisis de imágenes + descripción
-- Clasificación NCM/HS automática
+- Clasificación NCM/HS automática usando base de datos oficial
 - Determinación de régimen simplificado
 - Identificación de intervenciones
 - Output en JSON estructurado
 
 Autor: Desarrollado para comercio exterior
+Actualizado: Base de datos oficial NCM en lugar de scraping VUCE
 """
 
 import os
@@ -33,8 +34,6 @@ from typing import Dict, Any, Optional
 from urllib.parse import urlparse
 
 import asyncio
-
-from vuce_integration import VuceIntegration
 
 # Configurar logging
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -104,24 +103,12 @@ ESQUEMA JSON DE RESPUESTA OBLIGATORIO:
   "classification_method": "ia_analysis"   // Método usado para clasificación
 }
 
-ORGANISMOS DE INTERVENCIÓN MÁS COMUNES:
-- SENASA: Alimentos, productos de origen animal/vegetal, agroquímicos
-- ANMAT: Medicamentos, cosméticos, productos de salud, suplementos
-- INAL: Alimentos procesados
-- INTI: Productos eléctricos/electrónicos, juguetes, textiles, calzado
-- INTI-CIE: Específicamente productos eléctricos/electrónicos
-- CNEA: Materiales radioactivos
-- ACUMAR: Residuos, productos químicos peligrosos
-- AFIP: Productos alcohólicos, tabaco
-- Secretaría de Comercio: Licencias No Automáticas (LNA)
-
-ANÁLISIS INTELIGENTE DEL RÉGIMEN SIMPLIFICADO:
-- Si es electrónico/tecnológico y capítulo 84-85: GENERALMENTE SÍ aplica
-- Si es textil/ropa y capítulos 61-63: GENERALMENTE SÍ aplica  
-- Si es juguete y capítulo 95: SÍ aplica (verificar seguridad)
-- Si es alimento/bebida: GENERALMENTE NO aplica (requiere SENASA/INAL)
-- Si es medicamento/cosmético: NO aplica (requiere ANMAT)
-- Si es vehículo/autopartes: NO aplica
+IMPORTANTE: 
+- Siempre devuelve códigos NCM REALES y válidos
+- Si no estás seguro del código exacto, usa el más específico que puedas determinar
+- Las intervenciones deben ser organismos argentinos reales (ANMAT, INTI, SENASA, etc.)
+- El análisis de régimen simplificado debe ser detallado y basado en la normativa real
+- La confianza debe reflejar qué tan seguro estás de la clasificación (Alta: >90%, Media: 70-90%, Baja: <70%)
 """
 
 
@@ -241,79 +228,101 @@ class AINcmClassifier:
             initial_result["error"] = error_msg
             return initial_result
 
-        # 2. Enriquecer con datos de VUCE
-        logger.info(f"NCM obtenido: {ncm_code}. Buscando detalles en VUCE...")
+        # 2. Enriquecer con datos oficiales de NCM (CON REFINAMIENTO AUTOMÁTICO)
+        logger.info(f"NCM obtenido: {ncm_code}. Buscando detalles en base de datos oficial...")
         try:
-            vuce_integration = VuceIntegration()
-            vuce_details = await vuce_integration.get_ncm_info(ncm_code)
+            from ncm_official_integration import get_ncm_info_official
             
-            if vuce_details.get("success"):
-                logger.info("Detalles de VUCE obtenidos exitosamente.")
+            # Pasar la descripción del producto para refinamiento automático
+            ncm_details = await get_ncm_info_official(ncm_code, description)
+            
+            if ncm_details.get("success"):
+                was_refined = ncm_details.get("was_refined", False)
+                refinement_info = ncm_details.get("refinement_info", {})
                 
-                # Enriquecer el resultado con información oficial de VUCE
-                vuce_position = vuce_details.get("posicion_encontrada", {})
-                vuce_treatment = vuce_details.get("tratamiento_arancelario", {})
-                vuce_regime = vuce_details.get("regimen_simplificado", {})
-                vuce_interventions = vuce_details.get("intervenciones", {})
+                # ACTUALIZAR NCM_COMPLETO CON POSICIÓN OFICIAL COMPLETA (INCLUYENDO SUFIJO SIM)
+                ncm_position = ncm_details.get("posicion_encontrada", {})
+                official_ncm_code = ncm_position.get('codigo', '')
+                
+                if official_ncm_code:
+                    # Actualizar el código NCM con la posición oficial completa
+                    initial_result['ncm_completo'] = official_ncm_code
+                    logger.info(f"✅ NCM actualizado con posición oficial completa: {official_ncm_code}")
+                
+                if was_refined:
+                    logger.info(f"🎯 Detalles oficiales de NCM obtenidos con REFINAMIENTO automático")
+                    logger.info(f"   Original: {refinement_info.get('original_code', 'N/A')}")
+                    logger.info(f"   Refinado: {official_ncm_code}")
+                    logger.info(f"   Opciones evaluadas: {refinement_info.get('total_options', 'N/A')}")
+                else:
+                    logger.info("Detalles oficiales de NCM obtenidos exitosamente.")
+                
+                # Enriquecer el resultado con información oficial de base de datos NCM
+                ncm_treatment = ncm_details.get("tratamiento_arancelario", {})
+                ncm_regime = ncm_details.get("regimen_simplificado", {})
+                ncm_interventions = ncm_details.get("intervenciones", {})
                 
                 # Actualizar tratamiento arancelario con datos oficiales
                 initial_result['tratamiento_arancelario'] = {
-                    "derechos_importacion": vuce_treatment.get("arancel_externo_comun", "N/A"),
-                    "tasa_estadistica": f"{vuce_treatment.get('tasa_estadistica', 3.0)}%",
-                    "iva": f"{vuce_treatment.get('iva', 21.0)}%",
-                    "iva_adicional": f"{vuce_treatment.get('iva_adicional', 0.0)}%",
-                    "fuente": "VUCE Oficial"
+                    "derechos_importacion": f"{ncm_treatment.get('aec', 0)}%",
+                    "tasa_estadistica": f"{ncm_treatment.get('te', 3.0)}%",
+                    "iva": f"{ncm_treatment.get('iva', 21.0)}%",
+                    "iva_adicional": f"{ncm_treatment.get('iva_adicional', 0.0)}%",
+                    "fuente": ncm_treatment.get('fuente', 'Base de Datos Oficial NCM')
                 }
                 
-                # Enriquecer información de régimen simplificado con análisis de VUCE
+                # Enriquecer información de régimen simplificado con análisis oficial
                 if 'regimen_simplificado_courier' in initial_result:
-                    initial_result['regimen_simplificado_courier']['vuce_analysis'] = vuce_regime
+                    initial_result['regimen_simplificado_courier']['ncm_analysis'] = ncm_regime
                     
-                    # Combinar análisis de IA con análisis de VUCE
+                    # Combinar análisis de IA con análisis oficial de NCM
                     ia_aplica = initial_result['regimen_simplificado_courier'].get('aplica', 'No')
-                    vuce_aplica = vuce_regime.get('aplica_potencialmente', False)
+                    ncm_aplica = ncm_regime.get('aplica_potencialmente', False)
                     
-                    if ia_aplica == "Sí" and vuce_aplica:
+                    if ia_aplica == "Sí" and ncm_aplica:
                         final_decision = "Sí"
-                    elif ia_aplica == "No" or not vuce_aplica:
+                    elif ia_aplica == "No" or not ncm_aplica:
                         final_decision = "No"
                     else:
                         final_decision = "Condicional"
                     
                     initial_result['regimen_simplificado_courier']['aplica_final'] = final_decision
                     initial_result['regimen_simplificado_courier']['justificacion_combinada'] = (
-                        f"IA: {ia_aplica}. VUCE: {'Sí' if vuce_aplica else 'No'}. "
+                        f"IA: {ia_aplica}. Base oficial: {'Sí' if ncm_aplica else 'No'}. "
                         f"Decisión final: {final_decision}. "
-                        f"Factores VUCE: {', '.join(vuce_regime.get('factores_a_verificar', []))}"
+                        f"Factores a verificar: {', '.join(ncm_regime.get('factores_verificar', []))}"
                     )
                 
-                # Añadir información adicional de VUCE
-                initial_result['vuce_info'] = {
-                    "match_exacto": vuce_details.get("match_exacto", False),
-                    "descripcion_oficial": vuce_position.get("descripcion", ""),
-                    "fecha_actualizacion": vuce_details.get("metadata", {}).get("fecha_actualizacion"),
-                    "intervenciones_detectadas": vuce_interventions.get("organismos_potenciales", [])
+                # Añadir información adicional de la base de datos oficial
+                initial_result['ncm_official_info'] = {
+                    "match_exacto": ncm_details.get("match_exacto", False),
+                    "descripcion_oficial": ncm_position.get("descripcion", ""),
+                    "fecha_actualizacion": ncm_details.get("metadata", {}).get("last_updated"),
+                    "intervenciones_detectadas": ncm_interventions.get("organismos_potenciales", []),
+                    "source": "Base de Datos Oficial NCM",
+                    "was_refined": was_refined,
+                    "refinement_info": refinement_info
                 }
                 
-                # Enriquecer intervenciones si VUCE detectó organismos
-                vuce_organismos = vuce_interventions.get("organismos_potenciales", [])
-                if vuce_organismos:
+                # Enriquecer intervenciones si se detectaron organismos
+                ncm_organismos = ncm_interventions.get("organismos_potenciales", [])
+                if ncm_organismos:
                     if 'intervenciones_requeridas' not in initial_result:
                         initial_result['intervenciones_requeridas'] = []
                     
-                    # Combinar intervenciones de IA y VUCE (sin duplicados)
+                    # Combinar intervenciones de IA y base oficial (sin duplicados)
                     todas_intervenciones = list(set(
-                        initial_result.get('intervenciones_requeridas', []) + vuce_organismos
+                        initial_result.get('intervenciones_requeridas', []) + ncm_organismos
                     ))
                     initial_result['intervenciones_requeridas'] = todas_intervenciones
                 
             else:
-                logger.warning(f"No se pudieron obtener detalles de VUCE: {vuce_details.get('error', 'Error desconocido')}")
-                initial_result['vuce_warning'] = vuce_details.get('error', 'Error obteniendo datos de VUCE')
+                logger.warning(f"No se pudieron obtener detalles oficiales de NCM: {ncm_details.get('error', 'Error desconocido')}")
+                initial_result['ncm_warning'] = ncm_details.get('error', 'Error obteniendo datos oficiales de NCM')
                 
         except Exception as e:
-            logger.error(f"Error al consultar VUCE: {str(e)}")
-            initial_result['vuce_warning'] = f"Error al consultar VUCE: {str(e)}"
+            logger.error(f"Error al consultar base de datos oficial de NCM: {str(e)}")
+            initial_result['ncm_warning'] = f"Error al consultar base de datos oficial: {str(e)}"
 
         return initial_result
 

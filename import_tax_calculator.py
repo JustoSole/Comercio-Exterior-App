@@ -43,14 +43,6 @@ class OrigenMercancia(Enum):
     EXTRAZONA = "extrazona"
 
 
-class TipoDolar(Enum):
-    """Tipo de dólar utilizado para el pago"""
-    OFICIAL = "oficial"
-    MEP = "mep"
-    CCL = "ccl"
-    AHORRO = "ahorro"
-
-
 @dataclass
 class ImportData:
     """Datos básicos de la importación"""
@@ -58,7 +50,6 @@ class ImportData:
     tipo_importador: TipoImportador
     destino: DestinoImportacion
     origen: OrigenMercancia
-    tipo_dolar: TipoDolar
     derechos_importacion_pct: Optional[Decimal] = None
     es_bien_capital: bool = False
     tiene_exencion_iva: bool = False
@@ -105,8 +96,7 @@ class ImportTaxCalculator:
                 "inscripto": Decimal("0.06"),
                 "no_inscripto": Decimal("0.11")
             },
-            "iibb": Decimal("0.025"),
-            "impuesto_pais": Decimal("0.07125")
+            "iibb": Decimal("0.025")
         }
         
         # Configuraciones por provincia para IIBB (ejemplo)
@@ -162,10 +152,6 @@ class ImportTaxCalculator:
             # 5. Ingresos Brutos
             iibb = self._calculate_iibb(import_data, base_imponible_iva)
             impuestos.append(iibb)
-            
-            # 6. Impuesto PAÍS
-            impuesto_pais = self._calculate_impuesto_pais(import_data)
-            impuestos.append(impuesto_pais)
             
             # Calcular totales
             total_impuestos = sum(
@@ -368,34 +354,6 @@ class ImportTaxCalculator:
             observaciones=observaciones
         )
     
-    def _calculate_impuesto_pais(self, data: ImportData) -> TaxResult:
-        """
-        Calcula el Impuesto PAÍS (7.125%)
-        
-        Aplica: Si se usa dólar oficial para pago
-        No aplica: Si se usan dólares alternativos (MEP, CCL, ahorro)
-        Base: Valor CIF
-        """
-        aplica = data.tipo_dolar == TipoDolar.OFICIAL
-        alicuota = self.tax_rates["impuesto_pais"] if aplica else Decimal("0")
-        base_imponible = data.cif_value if aplica else Decimal("0")
-        monto = self._round_currency(base_imponible * alicuota)
-        
-        observaciones = ""
-        if aplica:
-            observaciones = "Aplica por uso de dólar oficial"
-        else:
-            observaciones = f"No aplica por uso de {data.tipo_dolar.value}"
-        
-        return TaxResult(
-            nombre="Impuesto PAÍS",
-            alicuota=alicuota,
-            base_imponible=base_imponible,
-            monto=monto,
-            aplica=aplica,
-            observaciones=observaciones
-        )
-    
     def _round_currency(self, amount: Decimal) -> Decimal:
         """Redondea un monto a 2 decimales"""
         return amount.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
@@ -423,7 +381,6 @@ class ImportTaxCalculator:
         report.append(f"   Tipo importador: {data.tipo_importador.value}")
         report.append(f"   Destino: {data.destino.value}")
         report.append(f"   Origen: {data.origen.value}")
-        report.append(f"   Tipo dólar: {data.tipo_dolar.value}")
         if data.es_bien_capital:
             report.append("   ⚙️ Bien de capital: Sí")
         report.append("")
@@ -485,7 +442,6 @@ class ImportTaxCalculator:
                 "tipo_importador": calculation.datos_importacion.tipo_importador,
                 "destino": calculation.datos_importacion.destino,
                 "origen": calculation.datos_importacion.origen,
-                "tipo_dolar": calculation.datos_importacion.tipo_dolar,
                 "es_bien_capital": calculation.datos_importacion.es_bien_capital,
                 "provincia": calculation.datos_importacion.provincia
             },
@@ -516,7 +472,6 @@ def calcular_impuestos_importacion(
     tipo_importador: str = "responsable_inscripto",
     destino: str = "reventa",
     origen: str = "extrazona",
-    tipo_dolar: str = "oficial",
     es_bien_capital: bool = False,
     provincia: str = "CABA",
     derechos_importacion_pct: Optional[float] = None
@@ -529,7 +484,6 @@ def calcular_impuestos_importacion(
         tipo_importador: Tipo de importador (responsable_inscripto, no_inscripto, monotributista)
         destino: Destino (reventa, uso_propio, bien_capital)
         origen: Origen (mercosur, extrazona)
-        tipo_dolar: Tipo de dólar (oficial, mep, ccl, ahorro)
         es_bien_capital: Si es bien de capital
         provincia: Provincia de destino para cálculo de IIBB.
         derechos_importacion_pct: Porcentaje de derechos de importación específico del NCM.
@@ -544,7 +498,6 @@ def calcular_impuestos_importacion(
         tipo_importador=TipoImportador(tipo_importador),
         destino=DestinoImportacion(destino),
         origen=OrigenMercancia(origen),
-        tipo_dolar=TipoDolar(tipo_dolar),
         es_bien_capital=es_bien_capital,
         provincia=provincia,
         derechos_importacion_pct=Decimal(str(derechos_importacion_pct)) if derechos_importacion_pct is not None else None
@@ -566,8 +519,7 @@ def main():
         cif_value=10000.0,
         tipo_importador="responsable_inscripto",
         destino="reventa",
-        origen="extrazona",
-        tipo_dolar="oficial"
+        origen="extrazona"
     )
     
     calculator = ImportTaxCalculator()
@@ -582,7 +534,6 @@ def main():
         tipo_importador="responsable_inscripto",
         destino="bien_capital",
         origen="mercosur",
-        tipo_dolar="mep",
         es_bien_capital=True
     )
     

@@ -50,5 +50,9 @@ python-dotenv>=1.0.0
 tqdm>=4.65.0
 charset-normalizer>=3.2.0
 
+# Google Sheets integration
+gspread>=5.0.0
+google-auth>=2.0.0
+
 # Configuration files
 toml>=0.10.0 
