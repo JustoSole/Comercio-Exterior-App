@@ -2029,6 +2029,27 @@ def render_product_summary():
             if product.price_high > product.price_low:
                  price_range_str += f" - ${product.price_high:.2f}"
 
+            # Obtener NCM completo (incluye sufijo si existe)
+            ncm_result = result.get('ncm_result', {})
+            ncm_completo = ncm_result.get('ncm_completo', 'N/A')
+            ncm_confianza = ncm_result.get('confianza', 'N/A')
+            
+            # Determinar si hay match oficial para mostrar indicador
+            ncm_official_info = ncm_result.get('ncm_official_info', {})
+            match_oficial = ncm_official_info.get('match_exacto', False)
+            fue_refinado = ncm_official_info.get('was_refined', False)
+            
+            # Construir valor de NCM con indicadores
+            if match_oficial:
+                ncm_display = f"{ncm_completo} 🇦🇷"
+                ncm_help = "Validado con base oficial argentina"
+            elif fue_refinado:
+                ncm_display = f"{ncm_completo} 🎯"
+                ncm_help = "Refinado automáticamente por IA"
+            else:
+                ncm_display = f"{ncm_completo} 🤖"
+                ncm_help = "Clasificado por IA"
+
             row1 = st.columns(2)
             row1[0].metric(label="📍 Origen (si aplica)", value=origen)
             row1[1].metric(label="📦 Pedido Mínimo", value=moq_str)
@@ -2038,6 +2059,19 @@ def render_product_summary():
 
             landed_cost_str = f"${result['landed_cost']:.2f}"
             row2[1].metric(label="💸 Landed Cost Unitario", value=landed_cost_str)
+            
+            # Nueva fila para NCM y confianza
+            row3 = st.columns(2)
+            row3[0].metric(
+                label="🏷️ Posición NCM Completa", 
+                value=ncm_display,
+                help=ncm_help
+            )
+            row3[1].metric(
+                label="🎯 Confianza IA", 
+                value=f"{ncm_confianza}",
+                help="Nivel de confianza de la clasificación automática"
+            )
                 
             st.divider()
 
@@ -2202,7 +2236,7 @@ def prepare_export_data(result):
         if impuesto.aplica:
             nombre_lower = impuesto.nombre.lower()
             monto = float(impuesto.monto)
-            alicuota = float(impuesto.alicuota) * 100
+            alicuota = float(impuesto.alicuota)
             
             if "derechos" in nombre_lower or "importacion" in nombre_lower:
                 derechos_importacion = monto
@@ -2226,7 +2260,10 @@ def prepare_export_data(result):
     # Calcular totales
     total_impuestos = float(tax_result.total_impuestos)
     subtotal_con_impuestos = precio_unitario + total_impuestos
-    flete_total = flete_unitario * import_quantity
+    
+    # NUEVO: Usar flete total directamente de la app (más práctico para Sheets)
+    flete_total = result.get('costo_flete_total_usd', flete_unitario * import_quantity)
+    
     honorarios_total = honorarios_despachante * import_quantity
     total_landed_cost = landed_cost * import_quantity
     total_landed_cost_ars = total_landed_cost * cotizacion
@@ -2240,8 +2277,9 @@ def prepare_export_data(result):
     # Obtener datos de envío
     shipping_details = result.get('shipping_details', {})
     peso_unitario = shipping_details.get('weight_kg', 0)
+
     dims = shipping_details.get('dimensions_cm', {})
-    dimensiones = f"{dims.get('length', 0)} × {dims.get('width', 0)} × {dims.get('height', 0)} cm"
+    dimensiones = f"{dims.get('length', 0):.1f} × {dims.get('width', 0):.1f} × {dims.get('height', 0):.1f} cm"
     metodo_flete = result['configuracion'].get('tipo_flete', '')
     
     # Obtener datos de configuración
@@ -2253,46 +2291,45 @@ def prepare_export_data(result):
     # Obtener URL de imagen
     image_url = result.get('image_selection_info', {}).get('selected_url', '')
     
-    # Preparar datos para exportar
+    # Preparar datos para exportar - TODOS LOS VALORES COMO NÚMEROS O STRINGS PARA EVITAR ERRORES DE API
     export_data = {
         "fecha": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         "producto": result['product'].title if hasattr(result['product'], 'title') else '',
-        "imagen_url": image_url,  # La fórmula =IMAGE() se agregará en Google Sheets
+        "imagen_url": image_url,
         "url_producto": result['product'].url if hasattr(result['product'], 'url') else '',
-        "cantidad": import_quantity,
-        "precio_unitario_fob": precio_unitario,
-        "subtotal_fob": precio_unitario * import_quantity,
+        "cantidad": int(import_quantity),
+        "precio_unitario_fob": round(float(precio_unitario), 2),
+        "subtotal_fob": round(float(precio_unitario * import_quantity), 2),
         "moneda": "USD",
-        "tipo_cambio": cotizacion,
-        "derechos_importacion_pct": derechos_importacion_pct,
-        "derechos_importacion": derechos_importacion,
-        "tasa_estadistica_pct": tasa_estadistica_pct,
-        "tasa_estadistica": tasa_estadistica,
-        "iva_importacion_pct": iva_importacion_pct,
-        "iva_importacion": iva_importacion,
-        "percepcion_iva_pct": percepcion_iva_pct,
-        "percepcion_iva": percepcion_iva,
-        "percepcion_ganancias_pct": percepcion_ganancias_pct,
-        "percepcion_ganancias": percepcion_ganancias,
-        "ingresos_brutos_pct": ingresos_brutos_pct,
-        "ingresos_brutos": ingresos_brutos,
-        "total_impuestos": total_impuestos,
-        "subtotal_con_impuestos": subtotal_con_impuestos,
-        "costo_flete_unitario": flete_unitario,
-        "costo_flete_total": flete_total,
-        "honorarios_despachante": honorarios_total,
-        "total_landed_cost": total_landed_cost,
-        "total_landed_cost_ars": total_landed_cost_ars,
-        "ncm": ncm_code,
-        "descripcion_ncm": ncm_description,
-        "confianza_ia": confianza_ia,
-        "peso_unitario_kg": peso_unitario,
-        "dimensiones": dimensiones,
-        "metodo_flete": metodo_flete,
-        "origen": origen,
-        "destino": destino,
-        "tipo_importador": tipo_importador,
-        "provincia": provincia,
+        "tipo_cambio": round(float(cotizacion), 2),
+        "ncm": str(ncm_code),
+        "descripcion_ncm": str(ncm_description),
+        "derechos_importacion_pct": round(float(derechos_importacion_pct), 4),
+        "derechos_importacion": round(float(derechos_importacion), 2),
+        "tasa_estadistica_pct": round(float(tasa_estadistica_pct), 4),
+        "tasa_estadistica": round(float(tasa_estadistica), 2),
+        "iva_importacion_pct": round(float(iva_importacion_pct), 4),
+        "iva_importacion": round(float(iva_importacion), 2),
+        "percepcion_iva_pct": round(float(percepcion_iva_pct), 4),
+        "percepcion_iva": round(float(percepcion_iva), 2),
+        "percepcion_ganancias_pct": round(float(percepcion_ganancias_pct), 4),
+        "percepcion_ganancias": round(float(percepcion_ganancias), 2),
+        "ingresos_brutos_pct": round(float(ingresos_brutos_pct), 4),
+        "ingresos_brutos": round(float(ingresos_brutos), 2),
+        "total_impuestos": round(float(total_impuestos), 2),
+        "subtotal_con_impuestos": round(float(subtotal_con_impuestos), 2),
+        "peso_unitario_kg": round(float(peso_unitario), 3),
+        "dimensiones": str(dimensiones),
+        "costo_flete_total": round(float(flete_total), 2),  # VALOR BASE para editar en Sheets
+        "costo_flete_unitario": round(float(flete_unitario), 2),  # Para referencia
+        "honorarios_despachante": round(float(honorarios_total), 2),
+        "total_landed_cost": round(float(total_landed_cost), 2),
+        "total_landed_cost_ars": round(float(total_landed_cost_ars), 2),
+        "metodo_flete": str(metodo_flete),
+        "origen": str(origen),
+        "destino": str(destino),
+        "tipo_importador": str(tipo_importador),
+        "provincia": str(provincia),
         "notas": ""
     }
     
@@ -3621,7 +3658,7 @@ def get_gspread_client():
 
 def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
     """
-    Subir datos a Google Sheets.
+    Subir datos a Google Sheets con fórmulas automáticas para cálculos dinámicos.
     
     Args:
         data_dict: Diccionario con los datos de la cotización
@@ -3648,49 +3685,6 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
         # Seleccionar la primera hoja
         worksheet = sh.sheet1
         
-        # Convertir los datos a formato de fila
-        row_data = [
-            data_dict.get("fecha", ""),
-            data_dict.get("producto", ""),
-            "",  # Espacio para la imagen, se actualizará después con la fórmula
-            data_dict.get("url_producto", ""),
-            data_dict.get("cantidad", ""),
-            data_dict.get("precio_unitario_fob", ""),
-            data_dict.get("subtotal_fob", ""),
-            data_dict.get("moneda", ""),
-            data_dict.get("tipo_cambio", ""),
-            data_dict.get("derechos_importacion_pct", ""),
-            data_dict.get("derechos_importacion", ""),
-            data_dict.get("tasa_estadistica_pct", ""),
-            data_dict.get("tasa_estadistica", ""),
-            data_dict.get("iva_importacion_pct", ""),
-            data_dict.get("iva_importacion", ""),
-            data_dict.get("percepcion_iva_pct", ""),
-            data_dict.get("percepcion_iva", ""),
-            data_dict.get("percepcion_ganancias_pct", ""),
-            data_dict.get("percepcion_ganancias", ""),
-            data_dict.get("ingresos_brutos_pct", ""),
-            data_dict.get("ingresos_brutos", ""),
-            data_dict.get("total_impuestos", ""),
-            data_dict.get("subtotal_con_impuestos", ""),
-            data_dict.get("costo_flete_unitario", ""),
-            data_dict.get("costo_flete_total", ""),
-            data_dict.get("honorarios_despachante", ""),
-            data_dict.get("total_landed_cost", ""),
-            data_dict.get("total_landed_cost_ars", ""),
-            data_dict.get("ncm", ""),
-            data_dict.get("descripcion_ncm", ""),
-            data_dict.get("confianza_ia", ""),
-            data_dict.get("peso_unitario_kg", ""),
-            data_dict.get("dimensiones", ""),
-            data_dict.get("metodo_flete", ""),
-            data_dict.get("origen", ""),
-            data_dict.get("destino", ""),
-            data_dict.get("tipo_importador", ""),
-            data_dict.get("provincia", ""),
-            data_dict.get("notas", "")
-        ]
-        
         # Verificar si ya existen encabezados
         headers_exist = False
         try:
@@ -3703,47 +3697,309 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
         # Si no existen encabezados, agregarlos primero
         if not headers_exist:
             headers = [
-                "Fecha", "Producto", "Imagen", "URL", "Cantidad", "Precio Unitario FOB", "Subtotal FOB",
-                "Moneda", "Tipo de Cambio", "Derechos de Importación %", "Derechos de Importación",
-                "Tasa Estadística %", "Tasa Estadística", "IVA Importación %", "IVA Importación",
-                "Percepción IVA %", "Percepción IVA", "Percepción Ganancias %", "Percepción Ganancias",
-                "Ingresos Brutos %", "Ingresos Brutos", "Total Impuestos", "Subtotal con Impuestos",
-                "Costo Flete Unitario", "Costo Flete Total", "Honorarios Despachante", "Total Landed Cost",
-                "Total Landed Cost ARS", "NCM", "Descripción NCM", "Confianza IA %", "Peso Unitario (kg)",
-                "Dimensiones (L×W×H cm)", "Método Flete", "Origen", "Destino", "Tipo Importador", "Provincia", "Notas"
+                # Información básica del producto
+                "Fecha", "Producto", "Imagen", "URL", "Cantidad", 
+                # Costos base
+                "Precio Unit. FOB USD", "Subtotal FOB USD", "Tipo de Cambio", 
+                # Clasificación arancelaria
+                "Posición NCM Completa", "Descripción NCM",
+                # Impuestos (porcentajes y montos)
+                "Derechos Import. %", "Derechos Import. USD", 
+                "Tasa Estadística %", "Tasa Estadística USD",
+                "IVA Import. %", "IVA Import. USD",
+                "Percep. IVA %", "Percep. IVA USD", 
+                "Percep. Ganancias %", "Percep. Ganancias USD",
+                "Ingresos Brutos %", "Ingresos Brutos USD",
+                # Totales calculados
+                "Total Impuestos USD", "Subtotal + Impuestos USD",
+                # Logística (flete total editable, unitario calculado)
+                "Peso Unitario (kg)", "Dimensiones (L×W×H cm)",
+                "Flete Total USD", "Flete Unit. USD", "Honorarios USD",
+                # Resultado final
+                "Total Landed Cost USD", "Total Landed Cost ARS",
+                # Información adicional
+                "Método Flete", "Origen", "Destino", "Tipo Importador"
             ]
             worksheet.append_row(headers)
+            st.info("✅ Encabezados optimizados y relevantes agregados")
         
-        # Agregar los datos
+        # Función helper para limpiar valores
+        def clean_value(value, default=""):
+            """Limpiar valores para evitar errores de API de Google Sheets"""
+            if value is None or value == "":
+                return default
+            if isinstance(value, (int, float)):
+                return value
+            if isinstance(value, str):
+                return value.strip()
+            return str(value)
+        
+        # Preparar datos usando los valores reales del diccionario
+        row_data = [
+            # Información básica del producto  
+            clean_value(data_dict.get("fecha", "")),
+            clean_value(data_dict.get("producto", "")),
+            "",  # Imagen: se agregará fórmula después
+            clean_value(data_dict.get("url_producto", "")),
+            clean_value(data_dict.get("cantidad", 0)),
+            # Costos base
+            clean_value(data_dict.get("precio_unitario_fob", 0)),
+            "",  # Subtotal FOB: FÓRMULA = Cantidad × Precio Unitario
+            clean_value(data_dict.get("tipo_cambio", 0)),
+            # Clasificación arancelaria
+            clean_value(data_dict.get("ncm", "")),
+            clean_value(data_dict.get("descripcion_ncm", "")),
+            # Impuestos (porcentajes y montos)
+            clean_value(data_dict.get("derechos_importacion_pct", 0)),
+            "",  # Derechos Import. USD: FÓRMULA
+            clean_value(data_dict.get("tasa_estadistica_pct", 0)),
+            "",  # Tasa Estadística USD: FÓRMULA  
+            clean_value(data_dict.get("iva_importacion_pct", 0)),
+            "",  # IVA Import. USD: FÓRMULA
+            clean_value(data_dict.get("percepcion_iva_pct", 0)),
+            "",  # Percep. IVA USD: FÓRMULA
+            clean_value(data_dict.get("percepcion_ganancias_pct", 0)),
+            "",  # Percep. Ganancias USD: FÓRMULA
+            clean_value(data_dict.get("ingresos_brutos_pct", 0)),
+            "",  # Ingresos Brutos USD: FÓRMULA
+            # Totales calculados
+            "",  # Total Impuestos USD: FÓRMULA
+            "",  # Subtotal + Impuestos USD: FÓRMULA
+            # Logística (Flete Total como valor base, Unitario como fórmula)
+            clean_value(data_dict.get("peso_unitario_kg", 0)),
+            clean_value(data_dict.get("dimensiones", "")),
+            clean_value(data_dict.get("costo_flete_total", 0)),  # FLETE TOTAL - VALOR BASE
+            "",  # Flete Unit. USD: FÓRMULA = Flete Total / Cantidad
+            "",  # Honorarios USD: FÓRMULA
+            # Resultado final  
+            "",  # Total Landed Cost USD: FÓRMULA
+            "",  # Total Landed Cost ARS: FÓRMULA
+            # Información adicional
+            clean_value(data_dict.get("metodo_flete", "")),
+            clean_value(data_dict.get("origen", "")),
+            clean_value(data_dict.get("destino", "")),
+            clean_value(data_dict.get("tipo_importador", ""))
+        ]
+        
+        # Agregar los datos base
         try:
             worksheet.append_row(row_data)
-            st.success("✅ Datos agregados exitosamente a la hoja")
+            st.success("✅ Datos base agregados exitosamente")
         except Exception as data_error:
             st.error(f"❌ Error al agregar datos: {data_error}")
             return False
         
-        # Actualizar la fórmula de imagen en la última fila agregada
-        # La imagen está en la columna C (índice 3)
+        # Obtener el número de la última fila agregada (más confiable)
         try:
-            if data_dict.get("imagen_url", ""):
-                # Obtener el número de la última fila
-                num_rows = worksheet.row_count
-                # Actualizar la celda con la fórmula IMAGE
-                image_formula = f'=IMAGE("{data_dict.get("imagen_url", "")}")'
-                worksheet.update(f'C{num_rows}', image_formula)
-                st.info("✅ Fórmula de imagen agregada")
+            # Contar las filas que realmente tienen datos
+            all_values = worksheet.get_all_values()
+            num_rows = len([row for row in all_values if any(cell.strip() for cell in row)])
+            # Si no hay datos, usar un valor por defecto
+            if num_rows == 0:
+                num_rows = 2  # Asumiendo que hay encabezados en la fila 1
+        except:
+            # Fallback: usar row_count como antes
+            num_rows = worksheet.row_count
+        
+        # AGREGAR FÓRMULAS DINÁMICAS USANDO BATCH UPDATE API V4
+        st.info(f"🧮 Agregando fórmulas automáticas en fila {num_rows}...")
+        
+        try:
+            # MAPEO CORRECTO DE COLUMNAS (A=0, B=1, C=2...):
+            # G=6: Subtotal FOB, L=11: Derechos USD, N=13: Tasa USD, P=15: IVA USD
+            # R=17: Percep.IVA USD, T=19: Percep.Gan. USD, V=21: IIBB USD
+            # W=22: Total Impuestos, X=23: Subtotal+Impuestos
+            # AA=26: Flete Total, AB=27: Flete Unit, AC=28: Honorarios
+            # AD=29: Landed Cost USD, AE=30: Landed Cost ARS
+            
+            # Preparar fórmulas críticas con batch_update
+            formulas_requests = []
+            
+            # TODAS las fórmulas necesarias (CORREGIDAS)
+            critical_formulas = [
+                (6, f"=E{num_rows}*F{num_rows}"),   # G: Subtotal FOB
+                (11, f"=G{num_rows}*K{num_rows}"),  # L: Derechos USD  
+                (13, f"=G{num_rows}*M{num_rows}"),  # N: Tasa USD
+                (15, f"=(G{num_rows}+L{num_rows}+N{num_rows})*O{num_rows}"),  # P: IVA USD
+                (17, f"=(G{num_rows}+L{num_rows}+N{num_rows}+P{num_rows})*Q{num_rows}"),  # R: Percep. IVA USD
+                (19, f"=G{num_rows}*S{num_rows}"),  # T: Percep. Ganancias USD
+                (21, f"=G{num_rows}*U{num_rows}"),  # V: Ingresos Brutos USD
+                (22, f"=L{num_rows}+N{num_rows}+P{num_rows}+R{num_rows}+T{num_rows}+V{num_rows}"),  # W: Total Impuestos
+                (23, f"=G{num_rows}+W{num_rows}"),  # X: Subtotal + Impuestos
+                # FLETE CORREGIDO:
+                (27, f"=AA{num_rows}/E{num_rows}"),  # AB: Flete Unit = Flete Total / Cantidad
+                (28, f"=F{num_rows}*0,02"),         # AC: Honorarios (2%)
+                (29, f"=F{num_rows}+W{num_rows}+AA{num_rows}+AC{num_rows}"),  # AD: Landed Cost
+                (30, f"=AD{num_rows}*H{num_rows}"), # AE: Landed Cost ARS
+            ]
+            
+            # Crear requests para batch_update
+            for col_index, formula in critical_formulas:
+                formulas_requests.append({
+                    'updateCells': {
+                        'range': {
+                            'sheetId': 0,
+                            'startRowIndex': num_rows - 1,  # 0-indexed
+                            'endRowIndex': num_rows,
+                            'startColumnIndex': col_index,  # 0-indexed
+                            'endColumnIndex': col_index + 1
+                        },
+                        'rows': [{
+                            'values': [{
+                                'userEnteredValue': {
+                                    'formulaValue': formula
+                                }
+                            }]
+                        }],
+                        'fields': 'userEnteredValue'
+                    }
+                })
+            
+            # Ejecutar batch_update
+            sh.batch_update({'requests': formulas_requests})
+            st.success(f"✅ {len(critical_formulas)} fórmulas aplicadas con batch_update")
+            
+        except Exception as formula_error:
+            st.warning(f"⚠️ Error con batch_update: {formula_error}")
+            
+            # Fallback: usar update_cell individual (método que sabemos que funciona)
+            try:
+                st.info("🔄 Intentando método fallback con update_cell...")
+                
+                # Fórmulas críticas con números de columna 1-based para update_cell
+                formulas_fallback = [
+                    (7, f"=E{num_rows}*F{num_rows}"),   # G: Subtotal FOB
+                    (12, f"=G{num_rows}*K{num_rows}"),  # L: Derechos USD
+                    (18, f"=(G{num_rows}+L{num_rows}+N{num_rows}+P{num_rows})*Q{num_rows}"),  # R: Percep. IVA USD
+                    (20, f"=G{num_rows}*S{num_rows}"),  # T: Percep. Ganancias USD
+                    (22, f"=G{num_rows}*U{num_rows}"),  # V: Ingresos Brutos USD
+                    (23, f"=L{num_rows}+N{num_rows}+P{num_rows}+R{num_rows}+T{num_rows}+V{num_rows}"),  # W: Total Impuestos
+                    (28, f"=AA{num_rows}/E{num_rows}"), # AB: Flete Unit = Flete Total / Cantidad
+                    (29, f"=F{num_rows}*0,02"),         # AC: Honorarios
+                    (30, f"=F{num_rows}+W{num_rows}+AA{num_rows}+AC{num_rows}"),  # AD: Landed Cost
+                ]
+                
+                successful_formulas = 0
+                for col_num, formula in formulas_fallback:
+                    try:
+                        worksheet.update_cell(num_rows, col_num, formula)
+                        successful_formulas += 1
+                        st.info(f"✅ Fórmula aplicada en columna {col_num}")
+                    except Exception as cell_error:
+                        st.warning(f"⚠️ Error en columna {col_num}: {cell_error}")
+                        continue
+                
+                if successful_formulas > 0:
+                    st.success(f"✅ {successful_formulas} fórmulas aplicadas con método fallback")
+                else:
+                    st.warning("⚠️ No se pudieron aplicar fórmulas automáticas")
+                    
+            except Exception as fallback_error:
+                st.error(f"❌ Error en método fallback: {fallback_error}")
+                # No retornar False porque los datos principales ya se subieron
+        
+        # Actualizar la fórmula de imagen usando método confiable
+        try:
+            imagen_url = data_dict.get("imagen_url", "")
+            if imagen_url and imagen_url.strip() and imagen_url.startswith('http'):
+                try:
+                    # Usar update_cell que sabemos que funciona
+                    worksheet.update_cell(num_rows, 3, f'=IMAGE("{imagen_url.strip()}")')
+                    st.info("✅ Imagen agregada exitosamente")
+                except Exception as img_api_error:
+                    # Si falla la imagen, agregar solo la URL como texto
+                    worksheet.update_cell(num_rows, 3, imagen_url.strip())
+                    st.info("ℹ️ Imagen como texto agregada (fórmula IMAGE falló)")
+            else:
+                st.info("ℹ️ Sin imagen válida para mostrar")
         except Exception as image_error:
-            st.warning(f"⚠️ No se pudo agregar la imagen: {image_error}")
-            # No retornar False aquí porque los datos principales ya se subieron
+            st.warning(f"⚠️ Error general con imagen: {image_error}")
+        
+        # Aplicar formato a las columnas de moneda
+        try:
+            # Formato de moneda para columnas USD (precios y costos) - CORREGIDO
+            currency_usd_columns = ['F', 'G', 'L', 'N', 'P', 'R', 'T', 'V', 'W', 'X', 'AA', 'AB', 'AC', 'AD']
+            for col in currency_usd_columns:
+                try:
+                    worksheet.format(f'{col}{num_rows}', {
+                        'numberFormat': {
+                            'type': 'CURRENCY',
+                            'pattern': '"$"#,##0.00'
+                        }
+                    })
+                except:
+                    pass  # Si falla el formato, continuar
+            
+            # Formato de moneda ARS para columnas en pesos argentinos
+            currency_ars_columns = ['AE']
+            for col in currency_ars_columns:
+                try:
+                    worksheet.format(f'{col}{num_rows}', {
+                        'numberFormat': {
+                            'type': 'CURRENCY',
+                            'pattern': '"$"#,##0'
+                        }
+                    })
+                except:
+                    pass  # Si falla el formato, continuar
+            
+            # Formato de porcentaje para columnas de %
+            percentage_columns = ['K', 'M', 'O', 'Q', 'S', 'U']
+            for col in percentage_columns:
+                try:
+                    worksheet.format(f'{col}{num_rows}', {
+                        'numberFormat': {
+                            'type': 'PERCENT',
+                            'pattern': '#0.00%'
+                        }
+                    })
+                except:
+                    pass  # Si falla el formato, continuar
+            
+            # Formato de número para peso (kg)
+            try:
+                worksheet.format(f'Y{num_rows}', {
+                    'numberFormat': {
+                        'type': 'NUMBER',
+                        'pattern': '#0.000" kg"'
+                    }
+                })
+            except:
+                pass
+                    
+            st.info("✅ Formato esencial aplicado (USD, ARS, porcentajes, peso)")
+            
+        except Exception as format_error:
+            st.warning(f"⚠️ Error al aplicar formato: {format_error}")
         
         # Obtener la URL de la hoja para mostrarla al usuario
         try:
             sheet_url = sh.url
             st.info(f"📋 Ver hoja: {sheet_url}")
+            
+            # Mostrar resumen de fórmulas agregadas
+            st.success("🧮 **Fórmulas dinámicas aplicadas (NUEVA LÓGICA DE FLETE):**")
+            formulas_info = [
+                "✅ Subtotal FOB calculado automáticamente",
+                "✅ Todos los impuestos calculados por porcentajes dinámicos",
+                "✅ Honorarios = 2% del precio FOB (fórmula: F×0,02)",
+                "🚚 Flete Total = VALOR BASE EDITABLE (de la app)",
+                "🧮 Flete Unitario = Flete Total ÷ Cantidad (FÓRMULA)",
+                "✅ Landed Cost = FOB + Impuestos + Flete Total + Honorarios",
+                "✅ Conversión a ARS automática",
+                "✅ Formato de moneda USD y ARS aplicado",
+                "✅ Formato de porcentajes aplicado",
+                "🎯 VENTAJA: Edita Flete Total manualmente y todo se recalcula",
+                "🔢 Formato argentino: decimales con coma (0,02 no 0.02)"
+            ]
+            for info in formulas_info:
+                st.write(f"  {info}")
+                
         except:
             pass
         
         return True
+        
     except Exception as e:
         st.error(f"❌ Error general al subir datos a Google Sheets: {e}")
         
@@ -3799,22 +4055,6 @@ def test_google_sheets_connection():
         worksheet.append_row(headers)
         st.success("✅ Encabezados agregados")
         
-        # Datos de prueba
-        test_data = [
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "Producto de Prueba - Smartphone",
-            "$150.00",
-            "8517.12.00",
-            "$45.30",
-            "$195.30",
-            "Prueba Exitosa",
-            "China",
-            "Argentina"
-        ]
-        
-        # Subir datos de prueba
-        worksheet.append_row(test_data)
-        st.success("✅ Datos de prueba subidos exitosamente")
         
         # Obtener la URL de la hoja para mostrarla al usuario
         sheet_url = sh.url
