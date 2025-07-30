@@ -454,9 +454,13 @@ def initialize_session_state():
         st.session_state.product_data_editable = {
             "title": "",
             "pricing_df": pd.DataFrame([{"min_quantity": 1, "price_usd": 0.0}]),
-            "dimensions_cm": {"length": 0.0, "width": 0.0, "height": 0.0},
-            "weight_kg": 0.0,
-            "import_quantity": 1,
+                    "dimensions_cm": {"length": 0.0, "width": 0.0, "height": 0.0},
+        "weight_kg": 0.0,
+        "import_quantity": 1,
+        "packaging_type": "individual",
+        "box_dimensions_cm": {"length": 0.0, "width": 0.0, "height": 0.0},
+        "box_total_weight_kg": 0.0,
+        "units_per_box": 1,
             "image_url": "",
             "product_url": "",
             "brand_name": "",
@@ -493,6 +497,10 @@ def initialize_session_state():
         default_datetime = datetime.now() + timedelta(days=3)
         default_datetime = default_datetime.replace(hour=14, minute=0, second=0, microsecond=0)
         st.session_state.planned_shipping_datetime = default_datetime
+    
+    # Inicializar información de debug NCM
+    if 'ncm_debug_info' not in st.session_state:
+        st.session_state.ncm_debug_info = {}
 
 def debug_log(message, data=None, level="INFO"):
     """Función de debug mejorada con nivel y categorización"""
@@ -619,6 +627,69 @@ def _get_intervenciones_from_ncm_result(ncm_result: dict) -> str:
         return ", ".join(intervenciones_unicas)
     else:
         return "Sin intervenciones"
+
+def _calculate_shipping_metrics(editable_data: dict, import_quantity: int) -> dict:
+    """
+    Calcula métricas de envío (peso, volumen, peso facturable) según el tipo de embalaje.
+    
+    Args:
+        editable_data: Datos del producto que incluyen peso, dimensiones y tipo de embalaje
+        import_quantity: Cantidad de unidades a importar
+    
+    Returns:
+        Dict con todas las métricas de envío calculadas
+    """
+    packaging_type = editable_data.get('packaging_type', 'individual')
+    
+    if packaging_type == "individual":
+        # EMBALAJE INDIVIDUAL: cada unidad en su propia caja
+        peso_unitario_kg = float(editable_data.get('weight_kg', 0.0))
+        dims = editable_data.get('dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
+        
+        peso_total_kg = peso_unitario_kg * import_quantity
+        
+        if all(d > 0 for d in dims.values()):
+            volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000
+            volumen_total_cbm = volumen_unitario_cbm * import_quantity
+            peso_volumetrico_kg = volumen_total_cbm * 167
+        else:
+            volumen_total_cbm = 0
+            peso_volumetrico_kg = 0
+            
+    else:  # multiple
+        # EMBALAJE MÚLTIPLE: usar peso total de la caja y calcular número de cajas necesarias
+        import math
+        units_per_box = editable_data.get('units_per_box', 1)
+        box_dims = editable_data.get('box_dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
+        box_total_weight_kg = float(editable_data.get('box_total_weight_kg', 0.0))
+        
+        # Calcular número de cajas necesarias
+        num_boxes = math.ceil(import_quantity / units_per_box)
+        
+        # Peso total = peso total de cada caja × número de cajas
+        peso_total_kg = box_total_weight_kg * num_boxes
+        
+        # Volumen basado en las dimensiones de las cajas
+        if all(d > 0 for d in box_dims.values()):
+            volumen_caja_cbm = (box_dims['length'] * box_dims['width'] * box_dims['height']) / 1_000_000
+            volumen_total_cbm = volumen_caja_cbm * num_boxes
+            peso_volumetrico_kg = volumen_total_cbm * 167
+        else:
+            volumen_total_cbm = 0
+            peso_volumetrico_kg = 0
+    
+    # Calcular peso facturable (el mayor entre peso físico y volumétrico)
+    peso_facturable_kg = max(peso_total_kg, peso_volumetrico_kg) if peso_volumetrico_kg > 0 else peso_total_kg
+    
+    return {
+        "peso_total_kg": peso_total_kg,
+        "volumen_total_cbm": volumen_total_cbm,
+        "peso_volumetrico_kg": peso_volumetrico_kg,
+        "peso_facturable_kg": peso_facturable_kg,
+        "packaging_type": packaging_type,
+        "num_boxes": math.ceil(import_quantity / editable_data.get('units_per_box', 1)) if packaging_type == "multiple" else import_quantity
+    }
+
 
 def _get_all_official_taxes_from_ncm_result(ncm_result: dict) -> dict:
     """
@@ -760,6 +831,174 @@ def clear_debug_data():
     st.session_state.console_output = []
     st.session_state.flow_steps = []
     st.session_state.current_step = None
+    st.session_state.ncm_debug_info = {}
+
+def render_ncm_classification_debug():
+    """Renderiza información detallada del proceso de clasificación NCM"""
+    ncm_debug = st.session_state.get('ncm_debug_info', {})
+    
+    if not ncm_debug:
+        st.info("🤖 No hay información de clasificación NCM disponible. Ejecuta un análisis primero.")
+        return
+    
+    # Información general del proceso
+    st.markdown("#### 📋 Información General del Proceso")
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("⏱️ Tiempo Total", f"{ncm_debug.get('processing_time_seconds', 0):.2f}s")
+    with col2:
+        st.metric("🔍 Método Usado", ncm_debug.get('method', 'N/A'))
+    with col3:
+        has_image = ncm_debug.get('has_image', False)
+        st.metric("📷 Con Imagen", "Sí" if has_image else "No")
+    
+    # Mostrar cada fase del proceso
+    if 'process_steps' in ncm_debug:
+        st.markdown("#### 🚀 Fases del Proceso de Clasificación")
+        
+        for i, step in enumerate(ncm_debug['process_steps'], 1):
+            status_icon = {"completed": "✅", "error": "❌", "started": "🟡"}.get(step.get('status', ''), "⚪")
+            
+            with st.expander(f"{status_icon} Fase {i}: {step.get('phase', 'Unknown').replace('_', ' ').title()}", expanded=True):
+                
+                if step['phase'] == 'initial_estimation':
+                    st.markdown("**🤖 Estimación Inicial con IA (Despachante de Aduanas)**")
+                    st.markdown(f"- **NCM Estimado:** `{step.get('ncm_estimated', 'N/A')}`")
+                    st.markdown(f"- **Nivel de Confianza:** {step.get('confidence', 'N/A')}")
+                    st.markdown(f"- **Requiere Exploración:** {'Sí' if step.get('requires_exploration') else 'No'}")
+                    
+                elif step['phase'] == 'hierarchical_exploration':
+                    st.markdown("**🔍 Exploración Jerárquica Profunda**")
+                    st.markdown(f"- **Candidatos Encontrados:** {step.get('candidates_found', 0)}")
+                    st.markdown(f"- **Posición Recomendada:** `{step.get('recommended_position', 'N/A')}`")
+    
+    # Debug info detallado por fase
+    debug_info = ncm_debug.get('debug_info', {})
+    
+    if debug_info.get('estimation_phase'):
+        st.markdown("#### 🧠 Detalles de Estimación Inicial")
+        with st.expander("📄 Análisis del Despachante de Aduanas", expanded=False):
+            estimation = debug_info['estimation_phase']
+            
+            st.markdown("**Factores Determinantes:**")
+            factors = estimation.get('factores_determinantes', [])
+            for factor in factors:
+                st.markdown(f"- {factor}")
+            
+            st.markdown("**Reglas de Interpretación Aplicadas:**")
+            rules = estimation.get('reglas_aplicadas', [])
+            for rule in rules:
+                st.markdown(f"- {rule}")
+            
+            st.markdown("**Justificación Técnica:**")
+            st.markdown(estimation.get('justificacion_ncm_inicial', 'No disponible'))
+            
+            if estimation.get('posibles_alternativas'):
+                st.markdown("**Alternativas Consideradas:**")
+                for alt in estimation['posibles_alternativas']:
+                    st.markdown(f"- `{alt.get('ncm', '')}`: {alt.get('razon', '')}")
+    
+    if debug_info.get('exploration_phase'):
+        st.markdown("#### 🔍 Detalles de Exploración Jerárquica")
+        with st.expander("📊 Exploración de Base de Datos Oficial", expanded=False):
+            exploration = debug_info['exploration_phase']
+            
+            st.markdown(f"**NCM Base:** `{exploration.get('initial_ncm', 'N/A')}`")
+            st.markdown(f"**Match Exacto Encontrado:** {'Sí' if exploration.get('exact_match_found') else 'No'}")
+            st.markdown(f"**Matches Jerárquicos:** {exploration.get('hierarchical_matches_count', 0)}")
+            
+            # Mostrar pasos de exploración
+            exploration_steps = exploration.get('exploration_steps', [])
+            if exploration_steps:
+                st.markdown("**Pasos de Exploración:**")
+                for i, exp_step in enumerate(exploration_steps, 1):
+                    step_type = exp_step.get('step', '').replace('_', ' ').title()
+                    st.markdown(f"{i}. **{step_type}**")
+                    
+                    if 'result' in exp_step:
+                        st.markdown(f"   - Resultado: {exp_step['result']}")
+                    if 'is_terminal' in exp_step:
+                        st.markdown(f"   - Es Terminal: {'Sí' if exp_step['is_terminal'] else 'No'}")
+                    if 'subcategories_found' in exp_step:
+                        st.markdown(f"   - Subcategorías: {exp_step['subcategories_found']}")
+            
+            # Mostrar candidatos finales
+            final_candidates = exploration.get('final_candidates', [])
+            if final_candidates:
+                st.markdown("**Candidatos Finales Evaluados:**")
+                
+                candidates_data = []
+                for candidate in final_candidates:
+                    candidates_data.append({
+                        'NCM Code': candidate.get('ncm_code', ''),
+                        'SIM Code': candidate.get('sim_code', ''),
+                        'Descripción': candidate.get('description', '')[:50] + "..." if len(candidate.get('description', '')) > 50 else candidate.get('description', ''),
+                        'Fuente': candidate.get('source', ''),
+                        'Confianza': candidate.get('confidence', ''),
+                        'AEC (%)': candidate.get('fiscal_data', {}).get('aec', 0)
+                    })
+                
+                import pandas as pd
+                df_candidates = pd.DataFrame(candidates_data)
+                st.dataframe(df_candidates, use_container_width=True)
+    
+    # Clasificación final
+    final_classification = ncm_debug.get('final_classification', {})
+    if final_classification:
+        st.markdown("#### 🎯 Clasificación Final Seleccionada")
+        
+        # Información principal
+        col1, col2 = st.columns(2)
+        with col1:
+            st.markdown(f"**NCM Completo:** `{final_classification.get('ncm_completo', 'N/A')}`")
+            st.markdown(f"**Descripción:** {final_classification.get('ncm_descripcion', 'N/A')}")
+            st.markdown(f"**Nivel de Confianza:** {final_classification.get('nivel_confianza', 'N/A')}")
+        
+        with col2:
+            st.markdown(f"**Fuente:** {final_classification.get('clasificacion_source', 'N/A')}")
+            st.markdown(f"**Método:** {final_classification.get('classification_method', 'N/A')}")
+        
+        # Tratamiento arancelario
+        tratamiento = final_classification.get('tratamiento_arancelario', {})
+        if tratamiento:
+            st.markdown("**💰 Tratamiento Arancelario:**")
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("AEC", tratamiento.get('derechos_importacion', 'N/A'))
+            with col2:
+                st.metric("Tasa Estadística", tratamiento.get('tasa_estadistica', 'N/A'))
+            with col3:
+                st.metric("IVA", tratamiento.get('iva', 'N/A'))
+            with col4:
+                st.metric("IVA Adicional", tratamiento.get('iva_adicional', 'N/A'))
+        
+        # Régimen simplificado
+        regimen = final_classification.get('regimen_simplificado_courier', {})
+        if regimen:
+            st.markdown("**📦 Régimen Simplificado Courier:**")
+            st.markdown(f"- **Aplica:** {regimen.get('aplica', 'N/A')}")
+            st.markdown(f"- **Justificación:** {regimen.get('justificacion', 'N/A')}")
+            st.markdown(f"- **Limitaciones:** {regimen.get('limitaciones', 'N/A')}")
+        
+        # Intervenciones
+        intervenciones = final_classification.get('intervenciones_requeridas', [])
+        if intervenciones:
+            st.markdown("**🏛️ Intervenciones Requeridas:**")
+            for intervencion in intervenciones:
+                st.markdown(f"- {intervencion}")
+        
+        # Justificación técnica completa
+        justificacion = final_classification.get('justificacion_clasificacion', '')
+        if justificacion:
+            with st.expander("📖 Justificación Técnica Completa", expanded=False):
+                st.markdown(justificacion)
+        
+        # Observaciones adicionales
+        observaciones = final_classification.get('observaciones_adicionales', '')
+        if observaciones:
+            with st.expander("📝 Observaciones del Despachante", expanded=False):
+                st.markdown(observaciones)
 
 def render_debug_tab():
     """Renderizar la tab de debug completa"""
@@ -784,7 +1023,8 @@ def render_debug_tab():
             "debug_logs": st.session_state.debug_logs,
             "api_responses": st.session_state.api_responses,
             "flow_steps": st.session_state.flow_steps,
-            "console_output": st.session_state.console_output
+            "console_output": st.session_state.console_output,
+            "ncm_classification_details": st.session_state.get('ncm_debug_info', {})
         }
         
         st.download_button(
@@ -795,8 +1035,8 @@ def render_debug_tab():
         )
     
     # Crear tabs secundarias para different tipos de debug
-    debug_tab1, debug_tab2, debug_tab3, debug_tab4 = st.tabs([
-        "📊 Flow Steps", "🔧 Console Output", "🌐 API Responses", "📝 Debug Logs"
+    debug_tab1, debug_tab2, debug_tab3, debug_tab4, debug_tab5 = st.tabs([
+        "📊 Flow Steps", "🎯 NCM Classification", "🔧 Console Output", "🌐 API Responses", "📝 Debug Logs"
     ])
     
     with debug_tab1:
@@ -824,6 +1064,10 @@ def render_debug_tab():
             st.info("No hay pasos del flujo registrados aún.")
     
     with debug_tab2:
+        st.subheader("🎯 Proceso de Clasificación NCM Detallado")
+        render_ncm_classification_debug()
+    
+    with debug_tab3:
         st.subheader("Output de Consola")
         if st.session_state.console_output:
             console_text = "\n".join(st.session_state.console_output)
@@ -835,7 +1079,7 @@ def render_debug_tab():
         else:
             st.info("No hay output de consola disponible.")
     
-    with debug_tab3:
+    with debug_tab4:
         st.subheader("Respuestas de APIs")
         if st.session_state.api_responses:
             for key, api_call in st.session_state.api_responses.items():
@@ -862,7 +1106,7 @@ def render_debug_tab():
         else:
             st.info("No hay llamadas a APIs registradas aún.")
     
-    with debug_tab4:
+    with debug_tab5:
         st.subheader("Logs Detallados")
         if st.session_state.debug_logs:
             # Filtros
@@ -944,13 +1188,80 @@ def render_editable_product_form():
     )
 
     st.markdown("##### Dimensiones y Peso")
-    col1, col2, col3, col4 = st.columns(4)
-    dims = pde.get('dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
-    dims['length'] = col1.number_input("Largo (cm)", value=dims.get('length', 0.0), min_value=0.0, format="%.2f")
-    dims['width'] = col2.number_input("Ancho (cm)", value=dims.get('width', 0.0), min_value=0.0, format="%.2f")
-    dims['height'] = col3.number_input("Alto (cm)", value=dims.get('height', 0.0), min_value=0.0, format="%.2f")
-    pde['dimensions_cm'] = dims
-    pde['weight_kg'] = col4.number_input("Peso (kg)", value=pde.get('weight_kg', 0.0), min_value=0.0, format="%.3f")
+    
+    # NUEVO: Selector de tipo de embalaje
+    st.markdown("**Tipo de Embalaje**")
+    packaging_type = st.radio(
+        "¿Cómo viene embalado el producto?",
+        options=["individual", "multiple"],
+        format_func=lambda x: {
+            "individual": "📦 Embalaje Individual - Cada unidad viene en su propia caja",
+            "multiple": "📦 Embalaje Múltiple - Varias unidades vienen en una caja más grande"
+        }[x],
+        key="packaging_type",
+        horizontal=False,
+        help="Selecciona el tipo de embalaje para calcular correctamente el peso y volumen del envío"
+    )
+    
+    # Almacenar en session state
+    pde['packaging_type'] = packaging_type
+    
+    if packaging_type == "individual":
+        # EMBALAJE INDIVIDUAL: Mostrar dimensiones y peso del producto individual
+        st.markdown("**Dimensiones y Peso del Producto Individual**")
+        col1, col2, col3, col4 = st.columns(4)
+        dims = pde.get('dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
+        dims['length'] = col1.number_input("Largo (cm)", value=dims.get('length', 0.0), min_value=0.0, format="%.2f", key="product_length")
+        dims['width'] = col2.number_input("Ancho (cm)", value=dims.get('width', 0.0), min_value=0.0, format="%.2f", key="product_width") 
+        dims['height'] = col3.number_input("Alto (cm)", value=dims.get('height', 0.0), min_value=0.0, format="%.2f", key="product_height")
+        pde['dimensions_cm'] = dims
+        pde['weight_kg'] = col4.number_input("Peso (kg)", value=pde.get('weight_kg', 0.0), min_value=0.0, format="%.3f", key="product_weight")
+        
+        # Asegurar que los campos de embalaje múltiple tengan valores por defecto
+        if 'box_dimensions_cm' not in pde:
+            pde['box_dimensions_cm'] = {"length": 0.0, "width": 0.0, "height": 0.0}
+        if 'box_total_weight_kg' not in pde:
+            pde['box_total_weight_kg'] = 0.0
+        if 'units_per_box' not in pde:
+            pde['units_per_box'] = 1
+            
+    else:  # multiple
+        # EMBALAJE MÚLTIPLE: Solo mostrar datos de la caja de envío
+        st.markdown("**Dimensiones y Peso de la Caja de Envío**")
+        st.caption("Especifica las dimensiones y peso total de la caja que contiene múltiples unidades")
+        
+        col1, col2, col3, col4 = st.columns(4)
+        
+        box_dims = pde.get('box_dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
+        box_dims['length'] = col1.number_input("Largo (cm)", value=box_dims.get('length', 0.0), min_value=0.0, format="%.2f", key="box_length")
+        box_dims['width'] = col2.number_input("Ancho (cm)", value=box_dims.get('width', 0.0), min_value=0.0, format="%.2f", key="box_width")
+        box_dims['height'] = col3.number_input("Alto (cm)", value=box_dims.get('height', 0.0), min_value=0.0, format="%.2f", key="box_height")
+        pde['box_dimensions_cm'] = box_dims
+        
+        pde['box_total_weight_kg'] = col4.number_input("Peso Total Caja (kg)", value=pde.get('box_total_weight_kg', 0.0), min_value=0.0, format="%.3f", key="box_total_weight", help="Peso total de la caja incluyendo todos los productos")
+        
+        # Unidades por caja
+        col_units, col_info = st.columns([1, 2])
+        with col_units:
+            pde['units_per_box'] = st.number_input(
+                "Unidades por Caja", 
+                value=int(pde.get('units_per_box', 1)), 
+                min_value=1, 
+                step=1,
+                key="units_per_box",
+                help="¿Cuántas unidades del producto contiene cada caja?"
+            )
+        
+        with col_info:
+            units_per_box = pde.get('units_per_box', 1)
+            if units_per_box > 1:
+                st.info(f"💡 Cada caja contiene {units_per_box} unidades del producto")
+        
+        # Asegurar que los campos individuales tengan valores por defecto
+        if 'dimensions_cm' not in pde:
+            pde['dimensions_cm'] = {"length": 0.0, "width": 0.0, "height": 0.0}
+        if 'weight_kg' not in pde:
+            pde['weight_kg'] = 0.0
 
     st.markdown("##### Embalaje y Cantidad")
     
@@ -977,47 +1288,101 @@ def render_editable_product_form():
     st.caption(f"El pedido mínimo (MOQ) para este producto es de {moq} unidades.")
     
     # Cálculos de peso y volumen para el envío
-    peso_unitario = pde.get('weight_kg', 0.0)
-    dims = pde.get('dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
     cantidad = pde.get('import_quantity', 1)
+    packaging_type = pde.get('packaging_type', 'individual')
     
-    # Calcular peso total
-    peso_total_kg = peso_unitario * cantidad
+    # Usar la función auxiliar para calcular métricas de envío
+    shipping_metrics = _calculate_shipping_metrics(pde, cantidad)
+    peso_total_kg = shipping_metrics["peso_total_kg"]
+    volumen_total_cbm = shipping_metrics["volumen_total_cbm"]
+    peso_volumetrico_kg = shipping_metrics["peso_volumetrico_kg"]
+    peso_facturable_kg = shipping_metrics["peso_facturable_kg"]
     
-    # Calcular volumen y peso volumétrico
-    if all(d > 0 for d in dims.values()):
-        volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000
-        volumen_total_cbm = volumen_unitario_cbm * cantidad
-        # Factor estándar para peso volumétrico aéreo: 167 kg/m³
-        peso_volumetrico_kg = volumen_total_cbm * 167
-    else:
-        volumen_total_cbm = 0
-        peso_volumetrico_kg = 0
+    # Generar información de packaging para mostrar al usuario
+    num_boxes = shipping_metrics.get("num_boxes", cantidad)
+    
+    if packaging_type == "individual":
+        packaging_info = f"📦 **Embalaje Individual**: {cantidad} unidad(es), cada una en su propia caja"
+    else:  # multiple
+        units_per_box = pde.get('units_per_box', 1)
+        packaging_info = f"📦 **Embalaje Múltiple**: {cantidad} unidad(es) en {num_boxes} caja(s) de {units_per_box} unidad(es) cada una"
+    
+    # Guardar datos de shipping para compatibilidad con el resto del código
+    pde['shipping_weight_kg'] = peso_total_kg
+    pde['shipping_volume_cbm'] = volumen_total_cbm
+    pde['shipping_volumetric_weight_kg'] = peso_volumetrico_kg
+    pde['shipping_billable_weight_kg'] = peso_facturable_kg
+    
+    # Mostrar información del tipo de embalaje
+    st.markdown(packaging_info)
     
     # Mostrar cálculos de peso y volumen
     col1, col2 = st.columns(2)
     with col1:
+        if packaging_type == "individual":
+            peso_unitario = pde.get('weight_kg', 0.0)
+            help_text = f"Peso físico total: {peso_unitario:.2f} kg × {cantidad} unidades"
+        else:
+            box_total_weight = pde.get('box_total_weight_kg', 0.0)
+            help_text = f"Peso total: {box_total_weight:.2f} kg por caja × {num_boxes} caja(s) = {peso_total_kg:.2f} kg"
+        
         st.metric(
             label="📦 Peso Total", 
             value=f"{peso_total_kg:.2f} kg",
-            help=f"Peso físico total: {peso_unitario:.2f} kg × {cantidad} unidades"
+            help=help_text
         )
     
     with col2:
+        if packaging_type == "individual":
+            help_text = f"Peso volumétrico: {volumen_total_cbm:.6f} m³ × 167 kg/m³ (factor aéreo estándar)"
+        else:
+            help_text = f"Peso volumétrico: {volumen_total_cbm:.6f} m³ × 167 kg/m³ (basado en {num_boxes} caja(s))"
+        
         st.metric(
             label="📐 Peso Volumétrico", 
             value=f"{peso_volumetrico_kg:.2f} kg" if peso_volumetrico_kg > 0 else "No calculable",
-            help=f"Peso volumétrico total: {volumen_total_cbm:.6f} m³ × 167 kg/m³ (factor aéreo estándar)"
+            help=help_text
         )
+    
+    # Mostrar peso facturable
+    col_facturable1, col_facturable2 = st.columns([1, 1])
+    with col_facturable1:
+        peso_facturable_diferencia = peso_facturable_kg - peso_total_kg
+        
+        st.metric(
+            label="⚖️ Peso Facturable", 
+            value=f"{peso_facturable_kg:.2f} kg",
+            delta=f"+{peso_facturable_diferencia:.2f} kg" if peso_facturable_diferencia > 0 else None,
+            help="Peso usado para calcular el costo de envío (mayor entre peso físico y volumétrico)"
+        )
+    
+    with col_facturable2:
+        if packaging_type == "multiple":
+            # Mostrar peso por unidad en embalaje múltiple
+            units_per_box = pde.get('units_per_box', 1)
+            box_total_weight = pde.get('box_total_weight_kg', 0.0)
+            peso_por_unidad = box_total_weight / units_per_box if units_per_box > 0 else 0
+            st.metric(
+                label="📊 Peso por Unidad",
+                value=f"{peso_por_unidad:.3f} kg",
+                help=f"Peso promedio por unidad en la caja: {box_total_weight:.2f} kg ÷ {units_per_box} unidades"
+            )
     
     # Mostrar información adicional del envío
     if volumen_total_cbm > 0:
         col3, col4 = st.columns(2)
         with col3:
+            if packaging_type == "individual":
+                dims = pde.get('dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
+                help_text = f"Volumen total: {dims['length']:.1f} × {dims['width']:.1f} × {dims['height']:.1f} cm × {cantidad} unidades"
+            else:
+                box_dims = pde.get('box_dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
+                help_text = f"Volumen total: {box_dims['length']:.1f} × {box_dims['width']:.1f} × {box_dims['height']:.1f} cm × {num_boxes} caja(s)"
+            
             st.metric(
                 label="📏 Volumen Total",
                 value=f"{volumen_total_cbm:.6f} m³",
-                help=f"Volumen total del envío: {dims['length']:.1f} × {dims['width']:.1f} × {dims['height']:.1f} cm × {cantidad} unidades"
+                help=help_text
             )
         
         with col4:
@@ -1233,6 +1598,10 @@ def fetch_and_populate_from_url(url):
     }
     pde['weight_kg'] = shipping_info.get('weight_kg', 0.0)
     pde['import_quantity'] = int(product.moq or 1)
+    
+    # Asegurar que el packaging_type esté establecido
+    if 'packaging_type' not in pde:
+        pde['packaging_type'] = 'individual'
 
     st.session_state.data_input_step_completed = True
     st.success("✅ Datos extraídos y procesados. Revisa y ajusta los valores si es necesario antes de calcular.")
@@ -1689,40 +2058,76 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
             properties=properties_dict
         )
 
-        # Paso 1: Clasificar NCM con Integración Refinada (IA + Position Matcher)
-        with st.spinner("🤖 Clasificando NCM con integración refinada (IA + Datos Oficiales)..."):
-            log_flow_step("CLASIFICACION_NCM_INTEGRADA", "STARTED")
+        # Paso 1: Clasificar NCM con Sistema Profundo (Despachante de Aduanas + Exploración Jerárquica)
+        with st.spinner("🎯 Clasificando NCM con sistema profundo (Despachante + Exploración Jerárquica)..."):
+            log_flow_step("CLASIFICACION_NCM_PROFUNDA", "STARTED")
             ncm_result = {}
             try:
                 enhanced_description = create_enhanced_description(product_for_analysis)
                 
-                # NUEVO: Usar clasificador oficial NCM actualizado
-                ai_classifier = AINcmClassifier(API_KEYS.get("OPENAI_API_KEY"))
+                # NUEVO: Usar clasificador profundo con expertise de despachante de aduanas
+                from ai_ncm_deep_classifier import DeepNCMClassifier
                 
-                integrated_result = asyncio.run(ai_classifier.classify_product(
+                deep_classifier = DeepNCMClassifier(
+                    api_key=API_KEYS.get("OPENAI_API_KEY"),
+                    debug_callback=debug_log
+                )
+                
+                deep_result = asyncio.run(deep_classifier.classify_product_deep(
                     description=enhanced_description,
                     image_url=editable_data['image_url']
                 ))
 
-                if integrated_result.get('error'):
-                    raise ValueError(integrated_result.get('error', 'Error en clasificación NCM'))
+                if deep_result.get('error'):
+                    raise ValueError(deep_result.get('error', 'Error en clasificación NCM profunda'))
                 
-                # El nuevo clasificador retorna directamente los datos estructurados
-                # integrated_result ya contiene toda la información necesaria
-                ncm_result = integrated_result
+                # Guardar información completa de debug NCM
+                st.session_state.ncm_debug_info = deep_result
                 
-                # Logging detallado del proceso de clasificación NCM
+                # Extraer clasificación final para compatibilidad
+                final_classification = deep_result.get('final_classification', {})
+                if not final_classification:
+                    raise ValueError("No se pudo obtener clasificación final del sistema profundo")
+                
+                # Convertir al formato esperado por el resto del sistema
+                ncm_result = {
+                    'ncm_completo': final_classification.get('ncm_completo', 'N/A'),
+                    'ncm_descripcion': final_classification.get('ncm_descripcion', ''),
+                    'confianza': final_classification.get('nivel_confianza', 'Media'),
+                    'justificacion_clasificacion': final_classification.get('justificacion_clasificacion', ''),
+                    'tratamiento_arancelario': final_classification.get('tratamiento_arancelario', {}),
+                    'regimen_simplificado_courier': final_classification.get('regimen_simplificado_courier', {}),
+                    'intervenciones_requeridas': final_classification.get('intervenciones_requeridas', []),
+                    'ncm_desglose': final_classification.get('ncm_desglose', {}),
+                    'observaciones_adicionales': final_classification.get('observaciones_adicionales', ''),
+                    'classification_method': final_classification.get('classification_method', 'deep_hierarchical_ai'),
+                    
+                    # Información adicional para debug
+                    'ncm_official_info': {
+                        'source': 'Deep NCM Classification System',
+                        'method': deep_result.get('method', ''),
+                        'processing_time': deep_result.get('processing_time_seconds', 0),
+                        'phases_completed': len(deep_result.get('process_steps', [])),
+                        'was_deep_analyzed': True
+                    }
+                }
+                
+                # Logging detallado del proceso de clasificación NCM profundo
                 ai_ncm = ncm_result.get('ncm_completo', 'N/A')
                 confianza = ncm_result.get('confianza', 'N/A')
-                fuente_oficial = ncm_result.get('ncm_official_info', {}).get('source', 'N/A')
+                processing_time = deep_result.get('processing_time_seconds', 0)
+                phases = len(deep_result.get('process_steps', []))
                 
-                log_flow_step("CLASIFICACION_NCM_OFICIAL", "SUCCESS", {
+                log_flow_step("CLASIFICACION_NCM_PROFUNDA_COMPLETADA", "SUCCESS", {
                     "ncm_completo": ai_ncm,
                     "confianza": confianza,
-                    "fuente_oficial": fuente_oficial
+                    "metodo": "deep_hierarchical_classification",
+                    "tiempo_procesamiento": f"{processing_time:.2f}s",
+                    "fases_completadas": phases,
+                    "clasificacion_source": final_classification.get('clasificacion_source', 'N/A')
                 })
                 
-                # Extraer información de validación del resultado integrado
+                # Extraer información para validación 
                 final_ncm = ncm_result.get('ncm_completo', 'N/A')
                 ncm_official_info = ncm_result.get('ncm_official_info', {})
                 match_exacto = ncm_official_info.get('match_exacto', False)
@@ -1792,24 +2197,27 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
         import_quantity = int(editable_data.get('import_quantity', 1))
         if import_quantity == 0: import_quantity = 1 # Evitar división por cero
 
-        peso_unitario_kg = float(editable_data['weight_kg'])
-        dims = editable_data['dimensions_cm']
+        # Calcular métricas de envío usando la nueva función que maneja ambos tipos de embalaje
+        shipping_metrics = _calculate_shipping_metrics(editable_data, import_quantity)
+        peso_total_kg = shipping_metrics["peso_total_kg"]
+        volumen_total_cbm = shipping_metrics["volumen_total_cbm"]
+        peso_volumetrico_total_kg = shipping_metrics["peso_volumetrico_kg"]
+        peso_facturable_kg = shipping_metrics["peso_facturable_kg"]
         
-        # Calcular pesos y volúmenes
-        peso_total_kg = peso_unitario_kg * import_quantity
-        
-        # Calcular peso volumétrico y volumen
-        volumen_unitario_cbm = 0
-        peso_volumetrico_total_kg = 0
-        if all(d > 0 for d in dims.values()):
-            volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000
-            volumen_total_cbm = volumen_unitario_cbm * import_quantity
-            peso_volumetrico_total_kg = volumen_total_cbm * 167  # Factor aéreo estándar
+        # Para compatibilidad con código existente - usar dimensiones correctas según tipo de embalaje
+        packaging_type = editable_data.get('packaging_type', 'individual')
+        if packaging_type == 'individual':
+            dims = editable_data.get('dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
+            peso_unitario_kg = float(editable_data.get('weight_kg', 0.0))
         else:
-            volumen_total_cbm = 0
-            
-        # Para flete aéreo, usar el mayor entre peso físico y volumétrico
-        peso_facturable_kg = max(peso_total_kg, peso_volumetrico_total_kg) if peso_volumetrico_total_kg > 0 else peso_total_kg
+            # Para embalaje múltiple, usar dimensiones de la caja para DHL
+            dims = editable_data.get('box_dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
+            # Calcular peso unitario estimado para compatibilidad
+            box_total_weight = float(editable_data.get('box_total_weight_kg', 0.0))
+            units_per_box = editable_data.get('units_per_box', 1)
+            peso_unitario_kg = box_total_weight / units_per_box if units_per_box > 0 else 0.0
+        
+        volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000 if all(d > 0 for d in dims.values()) else 0
 
         costo_flete_total_usd = 0
         metodo_calculo = "Sin datos"
@@ -1955,11 +2363,15 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
             "costo_flete_total_usd": costo_flete_total_usd,
             "peso_final_kg": peso_unitario_kg, # Mantenemos el peso unitario aquí
             "shipping_details": { # Usar los datos del formulario con información ampliada
-                "weight_kg": peso_unitario_kg,
+                "weight_kg": editable_data.get('weight_kg', 0.0),
                 "peso_total_kg": peso_total_kg,
                 "peso_volumetrico_total_kg": peso_volumetrico_total_kg,
                 "peso_facturable_kg": peso_facturable_kg,
-                "dimensions_cm": dims,
+                "dimensions_cm": editable_data.get('dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0}),
+                "box_dimensions_cm": editable_data.get('box_dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0}),
+                "box_total_weight_kg": editable_data.get('box_total_weight_kg', 0.0),
+                "units_per_box": editable_data.get('units_per_box', 1),
+                "packaging_type": editable_data.get('packaging_type', 'individual'),
                 "volumen_unitario_cbm": volumen_unitario_cbm,
                 "volumen_total_cbm": volumen_total_cbm,
                 "method": "Manual" if st.session_state.entry_mode == 'Ingreso Manual' else 'Edited',
@@ -2261,12 +2673,19 @@ def prepare_export_data(result):
     total_impuestos = float(tax_result.total_impuestos)
     subtotal_con_impuestos = precio_unitario + total_impuestos
     
-    # NUEVO: Usar flete total directamente de la app (más práctico para Sheets)
-    flete_total = result.get('costo_flete_total_usd', flete_unitario * import_quantity)
+    # CORREGIDO: Obtener flete total de manera más robusta
+    flete_total = 0
+    if 'costo_flete_total_usd' in result:
+        flete_total = result['costo_flete_total_usd']
+    elif 'shipping_details' in result and 'total_cost_usd' in result['shipping_details']:
+        flete_total = result['shipping_details']['total_cost_usd']
+    else:
+        # Fallback: calcular desde flete unitario
+        flete_total = flete_unitario * import_quantity
     
     honorarios_total = honorarios_despachante * import_quantity
     total_landed_cost = landed_cost * import_quantity
-    total_landed_cost_ars = total_landed_cost * cotizacion
+    # Eliminado: No cargar datos en ARS
     
     # Obtener datos de NCM
     ncm_result = result.get('ncm_result', {})
@@ -2274,29 +2693,85 @@ def prepare_export_data(result):
     ncm_description = ncm_result.get('ncm_descripcion', '')
     confianza_ia = ncm_result.get('confianza', '')
     
-    # Obtener datos de envío
+    # Obtener datos de envío - MEJORADO para incluir métricas completas
     shipping_details = result.get('shipping_details', {})
+    
+    # Calcular métricas de envío usando la función existente
+    shipping_metrics = _calculate_shipping_metrics(shipping_details, import_quantity)
+    
+    # Datos unitarios (para embalaje individual)
     peso_unitario = shipping_details.get('weight_kg', 0)
-
-    dims = shipping_details.get('dimensions_cm', {})
-    dimensiones = f"{dims.get('length', 0):.1f} × {dims.get('width', 0):.1f} × {dims.get('height', 0):.1f} cm"
+    dims_unitarias = shipping_details.get('dimensions_cm', {})
+    dimensiones_unitarias = f"{dims_unitarias.get('length', 0):.1f} × {dims_unitarias.get('width', 0):.1f} × {dims_unitarias.get('height', 0):.1f} cm"
+    
+    # Datos del envío total (aplica a ambos tipos de embalaje)
+    peso_total_envio = shipping_metrics.get('peso_total_kg', 0)
+    volumen_total_envio = shipping_metrics.get('volumen_total_cbm', 0)
+    peso_facturable = shipping_metrics.get('peso_facturable_kg', 0)
+    packaging_type = shipping_metrics.get('packaging_type', 'individual')
+    num_cajas = shipping_metrics.get('num_boxes', 1)
+    
+    # Para embalaje múltiple, también incluir datos de la caja
+    if packaging_type == 'multiple':
+        dims_caja = shipping_details.get('box_dimensions_cm', {})
+        dimensiones_caja = f"{dims_caja.get('length', 0):.1f} × {dims_caja.get('width', 0):.1f} × {dims_caja.get('height', 0):.1f} cm"
+        units_per_box = shipping_details.get('units_per_box', 1)
+    else:
+        dimensiones_caja = dimensiones_unitarias
+        units_per_box = 1
+    
     metodo_flete = result['configuracion'].get('tipo_flete', '')
     
     # Obtener datos de configuración
     tipo_importador = result['configuracion'].get('tipo_importador', '')
     destino = result['configuracion'].get('destino_importacion', '')
     provincia = result['configuracion'].get('provincia', '')
-    origen = result['product'].place_of_origin if hasattr(result['product'], 'place_of_origin') else ''
     
-    # Obtener URL de imagen
-    image_url = result.get('image_selection_info', {}).get('selected_url', '')
+    # CORREGIDO: Obtener origen de manera más robusta
+    origen = ''
+    if 'product' in result:
+        product = result['product']
+        if hasattr(product, 'place_of_origin'):
+            origen = product.place_of_origin
+        elif isinstance(product, dict) and 'place_of_origin' in product:
+            origen = product['place_of_origin']
+        elif isinstance(product, dict) and 'origen' in product:
+            origen = product['origen']
+    
+    # CORREGIDO: Obtener URL de imagen de manera más robusta
+    image_url = ''
+    if 'image_selection_info' in result and 'selected_url' in result['image_selection_info']:
+        image_url = result['image_selection_info']['selected_url']
+    elif 'product' in result:
+        product = result['product']
+        if hasattr(product, 'image_url'):
+            image_url = product.image_url
+        elif isinstance(product, dict) and 'image_url' in product:
+            image_url = product['image_url']
+    
+    # CORREGIDO: Obtener datos del producto de manera más robusta
+    producto_titulo = ''
+    producto_url = ''
+    if 'product' in result:
+        product = result['product']
+        if hasattr(product, 'title'):
+            producto_titulo = product.title
+        elif isinstance(product, dict) and 'title' in product:
+            producto_titulo = product['title']
+        elif isinstance(product, dict) and 'name' in product:
+            producto_titulo = product['name']
+            
+        if hasattr(product, 'url'):
+            producto_url = product.url
+        elif isinstance(product, dict) and 'url' in product:
+            producto_url = product['url']
     
     # Preparar datos para exportar - TODOS LOS VALORES COMO NÚMEROS O STRINGS PARA EVITAR ERRORES DE API
     export_data = {
         "fecha": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "producto": result['product'].title if hasattr(result['product'], 'title') else '',
-        "imagen_url": image_url,
-        "url_producto": result['product'].url if hasattr(result['product'], 'url') else '',
+        "producto": str(producto_titulo),
+        "imagen_url": str(image_url),
+        "url_producto": str(producto_url),
         "cantidad": int(import_quantity),
         "precio_unitario_fob": round(float(precio_unitario), 2),
         "subtotal_fob": round(float(precio_unitario * import_quantity), 2),
@@ -2319,12 +2794,19 @@ def prepare_export_data(result):
         "total_impuestos": round(float(total_impuestos), 2),
         "subtotal_con_impuestos": round(float(subtotal_con_impuestos), 2),
         "peso_unitario_kg": round(float(peso_unitario), 3),
-        "dimensiones": str(dimensiones),
+        "dimensiones_unitarias": str(dimensiones_unitarias),
+        "peso_total_envio_kg": round(float(peso_total_envio), 3),
+        "volumen_total_envio_cbm": round(float(volumen_total_envio), 6),
+        "peso_facturable_kg": round(float(peso_facturable), 3),
+        "tipo_embalaje": str(packaging_type),
+        "num_cajas": int(num_cajas),
+        "dimensiones_caja": str(dimensiones_caja),
+        "unidades_por_caja": int(units_per_box),
         "costo_flete_total": round(float(flete_total), 2),  # VALOR BASE para editar en Sheets
         "costo_flete_unitario": round(float(flete_unitario), 2),  # Para referencia
         "honorarios_despachante": round(float(honorarios_total), 2),
         "total_landed_cost": round(float(total_landed_cost), 2),
-        "total_landed_cost_ars": round(float(total_landed_cost_ars), 2),
+        # Eliminado: No exportar ARS
         "metodo_flete": str(metodo_flete),
         "origen": str(origen),
         "destino": str(destino),
@@ -2937,25 +3419,27 @@ def recalculate_and_update_session(result, new_price, new_flete_type, selected_o
         import_quantity = result['configuracion'].get('import_quantity', 1)
         shipping_details = result.get('shipping_details', {})
         
-        # Obtener datos de peso y dimensiones
-        peso_unitario = shipping_details.get('weight_kg', 1.0)
-        dims = shipping_details.get('dimensions_cm', {})
+        # Usar la nueva función de cálculo de métricas de envío
+        shipping_metrics = _calculate_shipping_metrics(shipping_details, import_quantity)
+        peso_total_kg = shipping_metrics["peso_total_kg"]
+        volumen_total_cbm = shipping_metrics["volumen_total_cbm"]
+        peso_volumetrico_total_kg = shipping_metrics["peso_volumetrico_kg"]
+        peso_facturable_kg = shipping_metrics["peso_facturable_kg"]
         
-        # Calcular pesos y volúmenes
-        peso_total_kg = peso_unitario * import_quantity
-        
-        # Calcular peso volumétrico y volumen
-        volumen_unitario_cbm = 0
-        peso_volumetrico_total_kg = 0
-        if all(d > 0 for d in dims.values()):
-            volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000
-            volumen_total_cbm = volumen_unitario_cbm * import_quantity
-            peso_volumetrico_total_kg = volumen_total_cbm * 167  # Factor aéreo estándar
+        # Para compatibilidad con código existente - usar dimensiones correctas según tipo de embalaje
+        packaging_type = shipping_details.get('packaging_type', 'individual')
+        if packaging_type == 'individual':
+            dims = shipping_details.get('dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
+            peso_unitario = shipping_details.get('weight_kg', 1.0)
         else:
-            volumen_total_cbm = 0
-            
-        # Para flete aéreo, usar el mayor entre peso físico y volumétrico
-        peso_facturable_kg = max(peso_total_kg, peso_volumetrico_total_kg) if peso_volumetrico_total_kg > 0 else peso_total_kg
+            # Para embalaje múltiple, usar dimensiones de la caja
+            dims = shipping_details.get('box_dimensions_cm', {"length": 0.0, "width": 0.0, "height": 0.0})
+            # Calcular peso unitario estimado para compatibilidad
+            box_total_weight = float(shipping_details.get('box_total_weight_kg', 0.0))
+            units_per_box = shipping_details.get('units_per_box', 1)
+            peso_unitario = box_total_weight / units_per_box if units_per_box > 0 else 1.0
+        
+        volumen_unitario_cbm = (dims['length'] * dims['width'] * dims['height']) / 1_000_000 if all(d > 0 for d in dims.values()) else 0
         
         flete_costo_total = 0.0
         metodo_calculo = "Sin datos"
@@ -3712,11 +4196,13 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
                 "Ingresos Brutos %", "Ingresos Brutos USD",
                 # Totales calculados
                 "Total Impuestos USD", "Subtotal + Impuestos USD",
-                # Logística (flete total editable, unitario calculado)
-                "Peso Unitario (kg)", "Dimensiones (L×W×H cm)",
+                # Logística detallada (individual vs múltiple)
+                "Peso Unitario (kg)", "Dimensiones Unitarias (L×W×H cm)",
+                "Peso Total Envío (kg)", "Volumen Total (m³)", "Peso Facturable (kg)",
+                "Tipo Embalaje", "Núm. Cajas", "Dimensiones Caja (L×W×H cm)", "Unidades/Caja",
                 "Flete Total USD", "Flete Unit. USD", "Honorarios USD",
                 # Resultado final
-                "Total Landed Cost USD", "Total Landed Cost ARS",
+                "Total Landed Cost USD",
                 # Información adicional
                 "Método Flete", "Origen", "Destino", "Tipo Importador"
             ]
@@ -3765,15 +4251,21 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
             # Totales calculados
             "",  # Total Impuestos USD: FÓRMULA
             "",  # Subtotal + Impuestos USD: FÓRMULA
-            # Logística (Flete Total como valor base, Unitario como fórmula)
+            # Logística detallada (individual vs múltiple)
             clean_value(data_dict.get("peso_unitario_kg", 0)),
-            clean_value(data_dict.get("dimensiones", "")),
+            clean_value(data_dict.get("dimensiones_unitarias", "")),
+            clean_value(data_dict.get("peso_total_envio_kg", 0)),
+            clean_value(data_dict.get("volumen_total_envio_cbm", 0)),
+            clean_value(data_dict.get("peso_facturable_kg", 0)),
+            clean_value(data_dict.get("tipo_embalaje", "")),
+            clean_value(data_dict.get("num_cajas", 1)),
+            clean_value(data_dict.get("dimensiones_caja", "")),
+            clean_value(data_dict.get("unidades_por_caja", 1)),
             clean_value(data_dict.get("costo_flete_total", 0)),  # FLETE TOTAL - VALOR BASE
             "",  # Flete Unit. USD: FÓRMULA = Flete Total / Cantidad
             "",  # Honorarios USD: FÓRMULA
             # Resultado final  
             "",  # Total Landed Cost USD: FÓRMULA
-            "",  # Total Landed Cost ARS: FÓRMULA
             # Información adicional
             clean_value(data_dict.get("metodo_flete", "")),
             clean_value(data_dict.get("origen", "")),
@@ -3805,32 +4297,32 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
         st.info(f"🧮 Agregando fórmulas automáticas en fila {num_rows}...")
         
         try:
-            # MAPEO CORRECTO DE COLUMNAS (A=0, B=1, C=2...):
+            # MAPEO CORRECTO DE COLUMNAS ACTUALIZADO (A=0, B=1, C=2...):
             # G=6: Subtotal FOB, L=11: Derechos USD, N=13: Tasa USD, P=15: IVA USD
             # R=17: Percep.IVA USD, T=19: Percep.Gan. USD, V=21: IIBB USD
             # W=22: Total Impuestos, X=23: Subtotal+Impuestos
-            # AA=26: Flete Total, AB=27: Flete Unit, AC=28: Honorarios
-            # AD=29: Landed Cost USD, AE=30: Landed Cost ARS
+            # Y=24: Peso Unit, Z=25: Dims Unit, AA=26: Peso Total, AB=27: Volumen, AC=28: Peso Fact
+            # AD=29: Tipo Emb, AE=30: Núm Cajas, AF=31: Dims Caja, AG=32: Units/Caja
+            # AH=33: Flete Total, AI=34: Flete Unit, AJ=35: Honorarios, AK=36: Landed Cost USD
             
             # Preparar fórmulas críticas con batch_update
             formulas_requests = []
             
-            # TODAS las fórmulas necesarias (CORREGIDAS)
+            # TODAS las fórmulas necesarias (CORREGIDAS CON MAPEO EXACTO)
             critical_formulas = [
-                (6, f"=E{num_rows}*F{num_rows}"),   # G: Subtotal FOB
-                (11, f"=G{num_rows}*K{num_rows}"),  # L: Derechos USD  
-                (13, f"=G{num_rows}*M{num_rows}"),  # N: Tasa USD
-                (15, f"=(G{num_rows}+L{num_rows}+N{num_rows})*O{num_rows}"),  # P: IVA USD
+                (6, f"=E{num_rows}*F{num_rows}"),   # G: Subtotal FOB = Cantidad × Precio Unit
+                (11, f"=G{num_rows}*K{num_rows}"),  # L: Derechos USD = Subtotal × % Derechos
+                (13, f"=G{num_rows}*M{num_rows}"),  # N: Tasa USD = Subtotal × % Tasa
+                (15, f"=(G{num_rows}+L{num_rows}+N{num_rows})*O{num_rows}"),  # P: IVA USD = (Base+Derechos+Tasa) × % IVA
                 (17, f"=(G{num_rows}+L{num_rows}+N{num_rows}+P{num_rows})*Q{num_rows}"),  # R: Percep. IVA USD
-                (19, f"=G{num_rows}*S{num_rows}"),  # T: Percep. Ganancias USD
-                (21, f"=G{num_rows}*U{num_rows}"),  # V: Ingresos Brutos USD
+                (19, f"=G{num_rows}*S{num_rows}"),  # T: Percep. Ganancias USD = Subtotal × %
+                (21, f"=G{num_rows}*U{num_rows}"),  # V: Ingresos Brutos USD = Subtotal × %
                 (22, f"=L{num_rows}+N{num_rows}+P{num_rows}+R{num_rows}+T{num_rows}+V{num_rows}"),  # W: Total Impuestos
                 (23, f"=G{num_rows}+W{num_rows}"),  # X: Subtotal + Impuestos
-                # FLETE CORREGIDO:
-                (27, f"=AA{num_rows}/E{num_rows}"),  # AB: Flete Unit = Flete Total / Cantidad
-                (28, f"=F{num_rows}*0,02"),         # AC: Honorarios (2%)
-                (29, f"=F{num_rows}+W{num_rows}+AA{num_rows}+AC{num_rows}"),  # AD: Landed Cost
-                (30, f"=AD{num_rows}*H{num_rows}"), # AE: Landed Cost ARS
+                # FLETE Y COSTOS FINALES (COLUMNAS ACTUALIZADAS):
+                (34, f"=AH{num_rows}/E{num_rows}"),  # AI: Flete Unit = Flete Total ÷ Cantidad
+                (35, f"=G{num_rows}*0,02"),         # AJ: Honorarios = 2% del Subtotal FOB (formato argentino)
+                (36, f"=G{num_rows}+W{num_rows}+AH{num_rows}+AJ{num_rows}"),  # AK: Landed Cost Total
             ]
             
             # Crear requests para batch_update
@@ -3866,17 +4358,20 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
             try:
                 st.info("🔄 Intentando método fallback con update_cell...")
                 
-                # Fórmulas críticas con números de columna 1-based para update_cell
+                # Fórmulas críticas con números de columna 1-based para update_cell (CORREGIDAS)
                 formulas_fallback = [
-                    (7, f"=E{num_rows}*F{num_rows}"),   # G: Subtotal FOB
-                    (12, f"=G{num_rows}*K{num_rows}"),  # L: Derechos USD
+                    (7, f"=E{num_rows}*F{num_rows}"),   # G: Subtotal FOB = Cantidad × Precio Unit
+                    (12, f"=G{num_rows}*K{num_rows}"),  # L: Derechos USD = Subtotal × % Derechos
+                    (14, f"=G{num_rows}*M{num_rows}"),  # N: Tasa USD = Subtotal × % Tasa
+                    (16, f"=(G{num_rows}+L{num_rows}+N{num_rows})*O{num_rows}"),  # P: IVA USD
                     (18, f"=(G{num_rows}+L{num_rows}+N{num_rows}+P{num_rows})*Q{num_rows}"),  # R: Percep. IVA USD
                     (20, f"=G{num_rows}*S{num_rows}"),  # T: Percep. Ganancias USD
                     (22, f"=G{num_rows}*U{num_rows}"),  # V: Ingresos Brutos USD
                     (23, f"=L{num_rows}+N{num_rows}+P{num_rows}+R{num_rows}+T{num_rows}+V{num_rows}"),  # W: Total Impuestos
-                    (28, f"=AA{num_rows}/E{num_rows}"), # AB: Flete Unit = Flete Total / Cantidad
-                    (29, f"=F{num_rows}*0,02"),         # AC: Honorarios
-                    (30, f"=F{num_rows}+W{num_rows}+AA{num_rows}+AC{num_rows}"),  # AD: Landed Cost
+                    (24, f"=G{num_rows}+W{num_rows}"),  # X: Subtotal + Impuestos
+                    (35, f"=AH{num_rows}/E{num_rows}"), # AI: Flete Unit = Flete Total ÷ Cantidad (ACTUALIZADO)
+                    (36, f"=G{num_rows}*0,02"),         # AJ: Honorarios = 2% del Subtotal FOB (ACTUALIZADO)
+                    (37, f"=G{num_rows}+W{num_rows}+AH{num_rows}+AJ{num_rows}"),  # AK: Landed Cost Total (ACTUALIZADO)
                 ]
                 
                 successful_formulas = 0
@@ -3917,8 +4412,8 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
         
         # Aplicar formato a las columnas de moneda
         try:
-            # Formato de moneda para columnas USD (precios y costos) - CORREGIDO
-            currency_usd_columns = ['F', 'G', 'L', 'N', 'P', 'R', 'T', 'V', 'W', 'X', 'AA', 'AB', 'AC', 'AD']
+            # Formato de moneda para columnas USD (precios y costos) - ACTUALIZADO
+            currency_usd_columns = ['F', 'G', 'L', 'N', 'P', 'R', 'T', 'V', 'W', 'X', 'AH', 'AI', 'AJ', 'AK']
             for col in currency_usd_columns:
                 try:
                     worksheet.format(f'{col}{num_rows}', {
@@ -3930,18 +4425,30 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
                 except:
                     pass  # Si falla el formato, continuar
             
-            # Formato de moneda ARS para columnas en pesos argentinos
-            currency_ars_columns = ['AE']
-            for col in currency_ars_columns:
+            # Formato para columnas numéricas especiales
+            # Peso (kg) - columnas Y, AA, AC
+            weight_columns = ['Y', 'AA', 'AC']
+            for col in weight_columns:
                 try:
                     worksheet.format(f'{col}{num_rows}', {
                         'numberFormat': {
-                            'type': 'CURRENCY',
-                            'pattern': '"$"#,##0'
+                            'type': 'NUMBER',
+                            'pattern': '#0.000" kg"'
                         }
                     })
                 except:
-                    pass  # Si falla el formato, continuar
+                    pass
+            
+            # Volumen (m³) - columna AB
+            try:
+                worksheet.format(f'AB{num_rows}', {
+                    'numberFormat': {
+                        'type': 'NUMBER',
+                        'pattern': '#0.000000" m³"'
+                    }
+                })
+            except:
+                pass
             
             # Formato de porcentaje para columnas de %
             percentage_columns = ['K', 'M', 'O', 'Q', 'S', 'U']
@@ -3956,16 +4463,18 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
                 except:
                     pass  # Si falla el formato, continuar
             
-            # Formato de número para peso (kg)
-            try:
-                worksheet.format(f'Y{num_rows}', {
-                    'numberFormat': {
-                        'type': 'NUMBER',
-                        'pattern': '#0.000" kg"'
-                    }
-                })
-            except:
-                pass
+            # Formato para columnas de cantidad (enteros)
+            integer_columns = ['E', 'AE', 'AG']  # Cantidad, Núm. Cajas, Unidades/Caja
+            for col in integer_columns:
+                try:
+                    worksheet.format(f'{col}{num_rows}', {
+                        'numberFormat': {
+                            'type': 'NUMBER',
+                            'pattern': '#0'
+                        }
+                    })
+                except:
+                    pass
                     
             st.info("✅ Formato esencial aplicado (USD, ARS, porcentajes, peso)")
             
@@ -3978,19 +4487,24 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
             st.info(f"📋 Ver hoja: {sheet_url}")
             
             # Mostrar resumen de fórmulas agregadas
-            st.success("🧮 **Fórmulas dinámicas aplicadas (NUEVA LÓGICA DE FLETE):**")
+            st.success("🧮 **Fórmulas dinámicas aplicadas (LOGÍSTICA MEJORADA - SIN ARS):**")
             formulas_info = [
-                "✅ Subtotal FOB calculado automáticamente",
-                "✅ Todos los impuestos calculados por porcentajes dinámicos",
-                "✅ Honorarios = 2% del precio FOB (fórmula: F×0,02)",
+                "✅ Subtotal FOB = Cantidad × Precio Unitario (E×F)",
+                "✅ Derechos = Subtotal FOB × % Derechos (G×K)",
+                "✅ Tasa Estadística = Subtotal FOB × % Tasa (G×M)",
+                "✅ IVA = (Base + Derechos + Tasa) × % IVA",
+                "✅ Percepciones calculadas según normativa argentina",
+                "✅ Honorarios = 2% del Subtotal FOB (G×0,02)",
+                "📦 NUEVO: Columnas específicas para embalaje múltiple",
+                "⚖️ Peso Total Envío, Volumen Total, Peso Facturable",
+                "📊 Núm. Cajas, Dimensiones Caja, Unidades/Caja",
                 "🚚 Flete Total = VALOR BASE EDITABLE (de la app)",
-                "🧮 Flete Unitario = Flete Total ÷ Cantidad (FÓRMULA)",
-                "✅ Landed Cost = FOB + Impuestos + Flete Total + Honorarios",
-                "✅ Conversión a ARS automática",
-                "✅ Formato de moneda USD y ARS aplicado",
-                "✅ Formato de porcentajes aplicado",
-                "🎯 VENTAJA: Edita Flete Total manualmente y todo se recalcula",
-                "🔢 Formato argentino: decimales con coma (0,02 no 0.02)"
+                "🧮 Flete Unitario = Flete Total ÷ Cantidad (AH÷E)",
+                "✅ Landed Cost = Subtotal + Impuestos + Flete + Honorarios",
+                "❌ ELIMINADO: Conversión a ARS (solo USD)",
+                "✅ Formato optimizado: USD, kg, m³, cantidades",
+                "🎯 VENTAJA: Claridad total entre embalaje individual vs múltiple",
+                "🔢 Fórmulas con formato argentino (comas como separador decimal)"
             ]
             for info in formulas_info:
                 st.write(f"  {info}")
