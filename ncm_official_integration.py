@@ -23,6 +23,7 @@ import os
 import json
 import re
 import logging
+import sys
 from typing import Dict, List, Optional, Union, Any, Tuple
 from pathlib import Path
 import pandas as pd
@@ -47,26 +48,97 @@ class NCMOfficialIntegration:
         self.load_dataset()
         
     def _find_latest_dataset(self, custom_path: Optional[str] = None) -> Optional[Path]:
-        """Encuentra el dataset más reciente de NCM"""
+        """Encuentra el dataset más reciente de NCM, generándolo si no existe"""
         if custom_path:
             return Path(custom_path)
             
         # Buscar en la carpeta de resultados
         results_dir = Path("pdf_reader/ncm/resultados_ncm_hybrid")
         if not results_dir.exists():
-            logger.error(f"Directorio de resultados no encontrado: {results_dir}")
-            return None
+            logger.warning(f"Directorio de resultados no encontrado: {results_dir}")
+            logger.info("Intentando generar datasets NCM automáticamente...")
+            return self._auto_generate_dataset()
             
         # Buscar archivos de dataset consolidado
         dataset_files = list(results_dir.glob("dataset_ncm_HYBRID_FIXED_*.json"))
         if not dataset_files:
-            logger.error("No se encontraron datasets NCM consolidados")
-            return None
+            logger.warning("No se encontraron datasets NCM consolidados")
+            logger.info("Intentando generar datasets NCM automáticamente...")
+            return self._auto_generate_dataset()
             
         # Retornar el más reciente
         latest_file = max(dataset_files, key=lambda f: f.stat().st_mtime)
         logger.info(f"Usando dataset NCM: {latest_file}")
         return latest_file
+    
+    def _auto_generate_dataset(self) -> Optional[Path]:
+        """Genera automáticamente los datasets NCM si no existen"""
+        try:
+            logger.info("🔧 Iniciando generación automática de datasets NCM...")
+            
+            # Verificar que existen los PDFs fuente
+            ncm_pdf_dir = Path("pdf_reader/ncm/ncm_pdf")
+            if not ncm_pdf_dir.exists():
+                logger.warning(f"Directorio de PDFs NCM no encontrado: {ncm_pdf_dir}")
+                logger.info("Esto es normal en Streamlit Cloud. Los PDFs no están incluidos en el repositorio.")
+                return None
+            
+            # Verificar que hay PDFs para procesar
+            pdf_files = list(ncm_pdf_dir.glob("capitulo_*.pdf"))
+            if not pdf_files:
+                logger.warning("No se encontraron archivos PDF de capítulos NCM")
+                logger.info("Esto es normal en Streamlit Cloud. Los PDFs no están incluidos en el repositorio.")
+                return None
+            
+            logger.info(f"Encontrados {len(pdf_files)} archivos PDF para procesar")
+            
+            # Importar y ejecutar el extractor
+            try:
+                # Añadir el directorio al path para importar el módulo
+                ncm_extractor_path = Path("pdf_reader/ncm")
+                if str(ncm_extractor_path) not in sys.path:
+                    sys.path.insert(0, str(ncm_extractor_path))
+                
+                # Importar dinámicamente el extractor
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(
+                    "ncm_extractor_hybrid_fix", 
+                    ncm_extractor_path / "ncm_extractor_hybrid_fix.py"
+                )
+                ncm_module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(ncm_module)
+                NCMExtractorHybridFix = ncm_module.NCMExtractorHybridFix
+                
+                logger.info("🏭 Ejecutando extractor NCM híbrido...")
+                extractor = NCMExtractorHybridFix()
+                
+                # Procesar todos los capítulos (esto puede tomar tiempo)
+                all_results = extractor.process_all_chapters(start_chapter=1, end_chapter=97)
+                
+                if all_results:
+                    # Crear dataset consolidado
+                    json_file, csv_file = extractor.create_consolidated_dataset(all_results)
+                    
+                    if json_file:
+                        logger.info(f"✅ Dataset generado exitosamente: {json_file}")
+                        return Path(json_file)
+                    else:
+                        logger.error("Error al crear dataset consolidado")
+                        return None
+                else:
+                    logger.error("No se pudieron extraer datos de los PDFs")
+                    return None
+                    
+            except ImportError as e:
+                logger.error(f"Error importando extractor NCM: {e}")
+                return None
+            except Exception as e:
+                logger.error(f"Error ejecutando extractor NCM: {e}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error en generación automática de dataset: {e}")
+            return None
         
     def load_dataset(self) -> bool:
         """Carga el dataset de NCM en memoria"""

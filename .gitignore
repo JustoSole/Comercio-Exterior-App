@@ -95,6 +95,9 @@ tmp/
 !requirements.txt
 !setup.py
 
+# Excepción: dataset NCM esencial para producción
+!pdf_reader/ncm/resultados_ncm_hybrid/dataset_ncm_HYBRID_FIXED_*.json
+
 # Streamlit
 .streamlit/secrets.toml
 
