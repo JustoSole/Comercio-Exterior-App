@@ -247,7 +247,10 @@ class DeepNCMClassifier:
         normalized_ncm = self.ncm_integration.normalize_ncm_code(initial_ncm)
         
         # 1. Buscar posición inicial en base de datos
+        self.debug_log(f"🔍 Buscando código exacto: {initial_ncm} → normalizado: {normalized_ncm}", level="DEBUG")
         exact_match = self.ncm_integration.search_exact_ncm(initial_ncm)
+        
+        self.debug_log(f"🔍 Buscando códigos jerárquicos para: {initial_ncm}", level="DEBUG")
         hierarchical_matches = self.ncm_integration.search_hierarchical_ncm(initial_ncm, max_results=10)
         
         exploration_result = {
@@ -257,10 +260,55 @@ class DeepNCMClassifier:
             "hierarchical_matches_count": len(hierarchical_matches),
             "exploration_steps": [],
             "final_candidates": [],
-            "recommended_position": None
+            "recommended_position": None,
+            "debug_info": {
+                "search_attempts": {
+                    "exact_search_query": initial_ncm,
+                    "normalized_query": normalized_ncm,
+                    "exact_match_result": "found" if exact_match else "not_found",
+                    "hierarchical_matches_found": len(hierarchical_matches)
+                }
+            }
         }
         
         self.debug_log(f"📊 Búsqueda inicial: exacto={bool(exact_match)}, jerárquico={len(hierarchical_matches)}", level="INFO")
+        
+        # DIAGNÓSTICO MEJORADO: Si no hay matches, intentar búsquedas alternativas
+        if not exact_match and not hierarchical_matches:
+            self.debug_log("⚠️ No se encontraron matches iniciales, intentando búsquedas alternativas", level="WARNING")
+            
+            # Intento 1: Búsqueda con código más corto (sin los últimos .00)
+            if initial_ncm.endswith('.00'):
+                shorter_code = initial_ncm[:-3]
+                self.debug_log(f"🔄 Intentando con código acortado: {shorter_code}", level="DEBUG")
+                exact_match = self.ncm_integration.search_exact_ncm(shorter_code)
+                hierarchical_matches = self.ncm_integration.search_hierarchical_ncm(shorter_code, max_results=10)
+                
+                if exact_match or hierarchical_matches:
+                    self.debug_log(f"✅ Encontrados con código acortado: exacto={bool(exact_match)}, jerárquico={len(hierarchical_matches)}", level="INFO")
+                    exploration_result["debug_info"]["alternative_search"] = {
+                        "tried_shorter_code": shorter_code,
+                        "exact_match_found": bool(exact_match),
+                        "hierarchical_matches_found": len(hierarchical_matches)
+                    }
+            
+            # Intento 2: Búsqueda solo con los primeros 6-8 dígitos
+            if not exact_match and not hierarchical_matches:
+                base_digits = re.sub(r'[.\s-]', '', initial_ncm)[:8]
+                if len(base_digits) >= 6:
+                    self.debug_log(f"🔄 Intentando con código base: {base_digits}", level="DEBUG")
+                    hierarchical_matches = self.ncm_integration.search_hierarchical_ncm(base_digits, max_results=15)
+                    
+                    if hierarchical_matches:
+                        self.debug_log(f"✅ Encontrados con código base: {len(hierarchical_matches)} matches", level="INFO")
+                        exploration_result["debug_info"]["base_search"] = {
+                            "tried_base_code": base_digits,
+                            "hierarchical_matches_found": len(hierarchical_matches)
+                        }
+        
+        # Actualizar contadores finales
+        exploration_result["exact_match_found"] = bool(exact_match)
+        exploration_result["hierarchical_matches_count"] = len(hierarchical_matches)
         
         # 2. Si hay match exacto, verificar si es terminal o requiere refinamiento
         if exact_match:
@@ -575,8 +623,11 @@ Responde ÚNICAMENTE el JSON:"""
             
             recommended = exploration_result.get("recommended_position")
             if recommended:
-                # Construir clasificación final completa
+                # Construir clasificación final completa con mapeo correcto de datos fiscales
                 fiscal_data = recommended.get("fiscal_data", {})
+                # Mapear también desde tratamiento_arancelario si fiscal_data está vacío
+                if not fiscal_data:
+                    fiscal_data = recommended.get("tratamiento_arancelario", {})
                 
                 final_classification = {
                     "ncm_completo": self._build_complete_ncm_code(recommended),
@@ -593,9 +644,10 @@ Responde ÚNICAMENTE el JSON:"""
                     # Tratamiento arancelario oficial
                     "tratamiento_arancelario": {
                         "derechos_importacion": f"{fiscal_data.get('aec', 0)}%",
+                        "die": f"{fiscal_data.get('die', 0)}%",  # Derecho de Importación Específico
                         "tasa_estadistica": f"{fiscal_data.get('te', 3.0)}%", 
                         "iva": f"{fiscal_data.get('iva', 21.0)}%",
-                        "iva_adicional": f"{fiscal_data.get('iva_adicional', 0.0)}%",
+                        "in_code": fiscal_data.get('in_code', ''),  # Código IN de intervenciones
                         "fuente": fiscal_data.get('fuente', 'Base de Datos Oficial NCM')
                     },
                     
@@ -620,9 +672,78 @@ Responde ÚNICAMENTE el JSON:"""
                 }, level="SUCCESS")
                 
             else:
-                # No se encontró posición recomendada
-                result["error"] = "No se pudo determinar una clasificación NCM apropiada después de la exploración jerárquica"
-                self.debug_log("❌ No se encontró posición NCM apropiada", level="ERROR")
+                # IMPLEMENTAR FALLBACK ROBUSTO
+                self.debug_log("⚠️ No se encontró posición recomendada, intentando fallback", level="WARNING")
+                
+                # Fallback 1: Usar estimación inicial si es confiable
+                initial_ncm = initial_estimation.get("ncm_inicial_estimado")
+                initial_confidence = initial_estimation.get("nivel_confianza_inicial", "").lower()
+                
+                if initial_ncm and initial_confidence in ["alta", "media"]:
+                    self.debug_log(f"🔄 Fallback: Usando estimación inicial {initial_ncm}", level="INFO")
+                    
+                    # Crear clasificación usando estimación inicial
+                    fallback_classification = {
+                        "ncm_completo": initial_ncm,
+                        "ncm_descripcion": f"Clasificación por estimación inicial (confianza: {initial_confidence})",
+                        "clasificacion_source": "fallback_initial_estimation",
+                        "nivel_confianza": initial_confidence,
+                        "justificacion_clasificacion": initial_estimation.get("justificacion_ncm_inicial", ""),
+                        "tratamiento_arancelario": {
+                            "derechos_importacion": "Pendiente de consulta oficial",
+                            "die": "Pendiente de consulta oficial",
+                            "tasa_estadistica": "3.0%",
+                            "iva": "21.0%",
+                            "in_code": "",
+                            "fuente": "Estimación IA con fallback"
+                        },
+                        "regimen_simplificado_courier": {
+                            "aplica": "Pendiente de verificación",
+                            "justificacion": "Requiere validación adicional con código final"
+                        },
+                        "observaciones_adicionales": "⚠️ Clasificación de fallback. Se recomienda validación manual.",
+                        "classification_method": "deep_hierarchical_ai_fallback"
+                    }
+                    
+                    result["final_classification"] = fallback_classification
+                    result["is_fallback"] = True
+                    
+                    self.debug_log("✅ Clasificación de fallback completada", {
+                        "fallback_ncm": initial_ncm,
+                        "confidence": initial_confidence
+                    }, level="SUCCESS")
+                    
+                else:
+                    # Fallback 2: Clasificación genérica de emergencia
+                    self.debug_log("🆘 Fallback de emergencia activado", level="WARNING")
+                    
+                    emergency_classification = {
+                        "ncm_completo": "9999.99.99",
+                        "ncm_descripcion": "Clasificación temporal - Requiere revisión manual",
+                        "clasificacion_source": "emergency_fallback",
+                        "nivel_confianza": "baja",
+                        "justificacion_clasificacion": "No se pudo determinar clasificación automática. Producto requiere análisis manual por despachante.",
+                        "tratamiento_arancelario": {
+                            "derechos_importacion": "Consultar AFIP",
+                            "die": "Consultar AFIP",
+                            "tasa_estadistica": "3.0%",
+                            "iva": "21.0%",
+                            "in_code": "",
+                            "fuente_datos": "Estimación IA"
+                        },
+                        "regimen_simplificado_courier": {
+                            "aplica": "No",
+                            "justificacion": "Clasificación no determinada"
+                        },
+                        "observaciones_adicionales": "🚨 CLASIFICACIÓN DE EMERGENCIA - REQUIERE REVISIÓN MANUAL INMEDIATA",
+                        "classification_method": "emergency_fallback"
+                    }
+                    
+                    result["final_classification"] = emergency_classification
+                    result["is_emergency_fallback"] = True
+                    result["requires_manual_review"] = True
+                    
+                    self.debug_log("🚨 Fallback de emergencia aplicado", level="WARNING")
             
         except Exception as e:
             self.debug_log(f"❌ Error en clasificación profunda: {e}", {"traceback": traceback.format_exc()}, level="ERROR")

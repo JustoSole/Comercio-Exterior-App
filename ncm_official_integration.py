@@ -186,31 +186,80 @@ class NCMOfficialIntegration:
         return None
         
     def search_hierarchical_ncm(self, ncm_code: str, max_results: int = 5) -> List[Dict[str, Any]]:
-        """Búsqueda jerárquica de códigos NCM similares"""
+        """Búsqueda jerárquica de códigos NCM similares con múltiples estrategias"""
         if not self.ncm_data:
+            logger.warning("No hay datos NCM cargados para búsqueda jerárquica")
             return []
             
         normalized_code = self.normalize_ncm_code(ncm_code)
         matches = []
+        search_attempts = []
         
-        # Búsqueda por prefijo (jerarquía)
+        logger.info(f"Búsqueda jerárquica para: {ncm_code} → {normalized_code}")
+        
+        # ESTRATEGIA 1: Búsqueda por prefijo (jerarquía) - ORIGINAL
         for length in [8, 6, 4, 2]:  # Buscar desde más específico a más general
             prefix = normalized_code[:length]
             if len(prefix) >= 2:  # Mínimo un capítulo
+                found_in_level = 0
                 for record in self.ncm_data:
                     record_code = record.get('code_searchable', '')
-                    if record_code.startswith(prefix) and len(matches) < max_results:
-                        enriched_record = self._enrich_ncm_record(record)
-                        enriched_record['match_type'] = f'hierarchical_{length}digits'
-                        enriched_record['match_score'] = self._calculate_match_score(normalized_code, record_code)
-                        matches.append(enriched_record)
-                        
-            if matches:  # Si encontramos matches en este nivel, retornar
-                break
+                    if record_code.startswith(prefix):
+                        if len(matches) < max_results * 2:  # Permitir más matches para luego filtrar
+                            enriched_record = self._enrich_ncm_record(record)
+                            enriched_record['match_type'] = f'hierarchical_{length}digits'
+                            enriched_record['match_score'] = self._calculate_match_score(normalized_code, record_code)
+                            matches.append(enriched_record)
+                            found_in_level += 1
                 
+                search_attempts.append(f"Nivel {length} dígitos: {found_in_level} encontrados")
+                        
+                # Si encontramos matches suficientes en un nivel específico, continuar para encontrar más específicos
+                if found_in_level > 0 and length >= 6:
+                    break
+        
+        # ESTRATEGIA 2: Si no hay matches, intentar con código sin últimos ceros
+        if not matches and normalized_code.endswith('00'):
+            shorter_code = normalized_code[:-2]
+            logger.info(f"Intentando búsqueda sin últimos ceros: {shorter_code}")
+            
+            for record in self.ncm_data:
+                record_code = record.get('code_searchable', '')
+                if record_code.startswith(shorter_code):
+                    if len(matches) < max_results:
+                        enriched_record = self._enrich_ncm_record(record)
+                        enriched_record['match_type'] = 'hierarchical_trimmed'
+                        enriched_record['match_score'] = self._calculate_match_score(shorter_code, record_code)
+                        matches.append(enriched_record)
+            
+            search_attempts.append(f"Código sin ceros: {len(matches)} encontrados")
+        
+        # ESTRATEGIA 3: Búsqueda flexible por capítulo si aún no hay matches
+        if not matches and len(normalized_code) >= 2:
+            chapter = normalized_code[:2]
+            logger.info(f"Búsqueda por capítulo: {chapter}")
+            
+            chapter_matches = 0
+            for record in self.ncm_data:
+                record_code = record.get('code_searchable', '')
+                if record_code.startswith(chapter):
+                    chapter_matches += 1
+                    if len(matches) < max_results:
+                        enriched_record = self._enrich_ncm_record(record)
+                        enriched_record['match_type'] = 'chapter_fallback'
+                        enriched_record['match_score'] = self._calculate_match_score(chapter, record_code[:2])
+                        matches.append(enriched_record)
+            
+            search_attempts.append(f"Capítulo {chapter}: {chapter_matches} total, {len(matches)} retornados")
+        
         # Ordenar por score de similitud
         matches.sort(key=lambda x: x.get('match_score', 0), reverse=True)
-        return matches[:max_results]
+        final_matches = matches[:max_results]
+        
+        logger.info(f"Búsqueda jerárquica completada: {len(final_matches)} matches finales")
+        logger.debug(f"Intentos de búsqueda: {'; '.join(search_attempts)}")
+        
+        return final_matches
         
     def _calculate_match_score(self, query_code: str, record_code: str) -> float:
         """Calcula score de similitud entre códigos"""
@@ -250,7 +299,6 @@ class NCMOfficialIntegration:
                 're': float(record.get('re', 0)),    # Reintegro de Exportación
                 'in_code': record.get('in', ''),     # Código IN oficial
                 'iva': 21.0,                         # IVA Argentina
-                'iva_adicional': 0.0,
                 'fuente': 'Base de Datos Oficial NCM'
             },
             

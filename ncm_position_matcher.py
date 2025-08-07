@@ -88,7 +88,7 @@ class NCMPosition:
                 'de': float(self.de),      # Datos adicionales oficiales
                 're': float(self.re),      # Datos adicionales oficiales
                 'iva': 21.0,  # IVA estándar Argentina
-                'iva_adicional': 0.0
+        
             },
             'interventions': self._get_interventions(),
             'simplified_regime': self._analyze_simplified_regime(),
@@ -821,6 +821,23 @@ async def match_single_ncm(input_query: str, data_file: str, ai_api_key: str = N
     matcher = NCMPositionMatcher(data_file, ai_api_key)
     return await matcher.match_position(input_query)
 
+def find_latest_ncm_dataset(fallback_path: str = None) -> str:
+    """Encuentra el dataset NCM más reciente automáticamente"""
+    from pathlib import Path
+    
+    # Buscar en la carpeta de resultados
+    results_dir = Path("pdf_reader/ncm/resultados_ncm_hybrid")
+    if results_dir.exists():
+        # Buscar archivos de dataset consolidado
+        dataset_files = list(results_dir.glob("dataset_ncm_HYBRID_FIXED_*.csv"))
+        if dataset_files:
+            # Retornar el más reciente
+            latest_file = max(dataset_files, key=lambda f: f.stat().st_mtime)
+            return str(latest_file)
+    
+    # Usar fallback si no se encuentra nada
+    return fallback_path or 'pdf_reader/ncm/resultados_ncm_hybrid/dataset_ncm_HYBRID_FIXED_20250721_175449.csv'
+
 def validate_ncm_code(code: str) -> bool:
     """Valida formato de código NCM"""
     patterns = [
@@ -848,7 +865,7 @@ Ejemplos de uso:
     )
     
     parser.add_argument('--input', '-i', type=str, help='Código NCM o descripción a buscar')
-    parser.add_argument('--data', '-d', type=str, default='pdf_reader/ncm/resultados_ncm_hybrid/dataset_ncm_HYBRID_FIXED_20250721_175449.csv', help='Archivo CSV con datos NCM')
+    parser.add_argument('--data', '-d', type=str, default=None, help='Archivo CSV con datos NCM (usa el más reciente si no se especifica)')
     parser.add_argument('--output', '-o', type=str, help='Archivo de salida para resultados (opcional)')
     parser.add_argument('--batch', '-b', type=str, help='Archivo JSON con múltiples consultas')
     parser.add_argument('--stats', action='store_true', help='Mostrar estadísticas del dataset')
@@ -859,6 +876,11 @@ Ejemplos de uso:
     
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Buscar dataset automáticamente si no se especifica
+    if not args.data:
+        args.data = find_latest_ncm_dataset()
+        print(f"📁 Usando dataset automático: {args.data}")
     
     # Verificar archivo de datos
     if not Path(args.data).exists():

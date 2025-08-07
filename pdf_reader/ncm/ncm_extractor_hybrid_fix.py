@@ -145,8 +145,93 @@ class NCMTableProcessor:
             return False
     
     @staticmethod
+    def is_likely_ncm_reference(cell: str, value: float, context_parts: List[str]) -> bool:
+        """
+        Algoritmo inteligente para detectar si un número es una referencia a código NCM
+        en lugar de un valor de impuesto
+        """
+        
+        # 1. **FILTRO POR RANGO**: Valores extremadamente altos son probablemente códigos NCM
+        if value > 50000:  # Impuestos > 50000% son irreales
+            return True
+        
+        # 2. **FILTRO POR ESTRUCTURA**: Detectar patrones de códigos NCM sin puntos
+        cell_str = str(int(value))
+        
+        # Si es un número de 6-8 dígitos sin decimales significativos
+        if len(cell_str) >= 6 and value == int(value):
+            # 3. **ANÁLISIS DE CONTEXTO**: Verificar palabras clave en la descripción
+            context_text = ' '.join(context_parts).lower() if context_parts else ''
+            
+            # Palabras que indican referencia a otros códigos NCM
+            reference_indicators = [
+                'excepto', 'del ítem', 'de la subpartida', 'de los ítem', 'de la partida',
+                'citadas en el ítem', 'mencionados en', 'referidos en', 'incluidos en',
+                'contemplados en', 'comprendidos en', 'clasificados en'
+            ]
+            
+            # Si hay indicadores de referencia, es muy probable que sea un código NCM
+            if any(indicator in context_text for indicator in reference_indicators):
+                return True
+            
+            # 4. **FILTRO POR PATRÓN NUMÉRICO**: Códigos que siguen estructura NCM
+            # Los códigos NCM reales siguen patrones específicos
+            if NCMTableProcessor.matches_ncm_pattern(cell_str):
+                return True
+        
+        # 5. **FILTRO POR CONTEXTO SEMÁNTICO**: Si ya encontramos varios números altos
+        if len([p for p in context_parts if NCMTableProcessor.is_numeric_value(p) and float(p) > 10000]) >= 2:
+            # Probablemente estamos en una sección de referencias múltiples
+            return value > 10000
+        
+        return False
+    
+    @staticmethod
+    def matches_ncm_pattern(number_str: str) -> bool:
+        """Verifica si un número sigue patrones típicos de códigos NCM"""
+        if len(number_str) < 6:
+            return False
+            
+        # Patrones comunes en códigos NCM argentinos:
+        # - Capítulos 01-97: primeros dos dígitos entre 01 y 97
+        # - Partidas: 4 dígitos + 2 dígitos
+        # - Subpartidas: 6 dígitos + extensiones
+        
+        try:
+            chapter = int(number_str[:2])
+            # Capítulos NCM válidos van del 01 al 97
+            if 1 <= chapter <= 97:
+                return True
+        except ValueError:
+            pass
+            
+        return False
+    
+    @staticmethod
+    def is_valid_tax_value(value: float) -> bool:
+        """Valida si un valor es un impuesto razonable"""
+        
+        # 1. Rango básico: 0% a 1000% cubre la mayoría de impuestos reales
+        if 0 <= value <= 1000:
+            return True
+        
+        # 2. Permitir algunos valores altos pero razonables (hasta 5000%)
+        # para casos especiales como impuestos específicos o multas
+        if 1000 < value <= 5000:
+            return True
+        
+        # 3. Valores entre 5000% y 10000% requieren validación adicional
+        if 5000 < value <= 10000:
+            # Solo si es un número "redondo" (probablemente real)
+            if value % 100 == 0 or value % 50 == 0:
+                return True
+        
+        # 4. Rechazar valores extremos
+        return False
+    
+    @staticmethod
     def identify_row_structure(cells: List[str]) -> Optional[Dict]:
-        """Identifica la estructura de una fila - MOTOR QUE FUNCIONA"""
+        """Identifica la estructura de una fila - MOTOR QUE FUNCIONA - CORREGIDO"""
         if len(cells) < 2:
             return None
         
@@ -184,10 +269,21 @@ class NCMTableProcessor:
                 sim_found = True
                 continue
             
-            # Identificar valores numéricos
+            # **CORRECCIÓN CRÍTICA V2**: Filtrado inteligente de valores numéricos
             if NCMTableProcessor.is_numeric_value(cell):
                 try:
-                    numeric_values.append(float(cell))
+                    value = float(cell)
+                    
+                    # **ALGORITMO INTELIGENTE DE CLASIFICACIÓN**
+                    if NCMTableProcessor.is_likely_ncm_reference(cell, value, desc_parts):
+                        # Es una referencia a código NCM, agregar a descripción
+                        desc_parts.append(cell)
+                        continue
+                    
+                    # **FILTROS DE VALIDACIÓN PARA IMPUESTOS**
+                    if NCMTableProcessor.is_valid_tax_value(value):
+                        numeric_values.append(value)
+                        
                 except ValueError:
                     pass
                 continue
@@ -205,16 +301,50 @@ class NCMTableProcessor:
         if desc_parts:
             result['descripcion'] = ' '.join(desc_parts)
         
-        # Asignar valores numéricos
+        # **CORRECCIÓN CRÍTICA**: Asignar valores numéricos solo si son razonables
         numeric_fields = ['aec', 'die', 'te', 'de', 're']
         for i, value in enumerate(numeric_values[:len(numeric_fields)]):
-            result[numeric_fields[i]] = value
+            # **VALIDACIÓN ADICIONAL**: Solo asignar valores de impuestos razonables
+            if 0 <= value <= 10000:  # Impuestos entre 0% y 10000%
+                result[numeric_fields[i]] = value
         
         # Solo devolver si encontramos al menos un código NCM
         if result['ncm']:
             return result
         
         return None
+
+    @staticmethod
+    def validate_extracted_record(record: Dict) -> bool:
+        """Valida que un registro extraído sea coherente y útil - VERSION INTELIGENTE"""
+        if not record:
+            return False
+            
+        # El código NCM debe existir y tener formato válido
+        ncm_code = record.get('ncm', '')
+        if not ncm_code or len(ncm_code.replace('.', '').replace(' ', '')) < 4:
+            return False
+            
+        # **VALIDACIÓN INTELIGENTE DE IMPUESTOS**
+        tax_fields = ['aec', 'die', 'te', 'de', 're']
+        for field in tax_fields:
+            value = record.get(field, 0)
+            if not isinstance(value, (int, float)) or value < 0:
+                return False
+            
+            # Usar validación inteligente en lugar de límite fijo
+            if value > 0 and not NCMTableProcessor.is_valid_tax_value(value):
+                return False
+                
+        # **VALIDACIÓN FLEXIBLE DE DESCRIPCIÓN**
+        # Permitir registros sin descripción si tienen código NCM válido
+        # (algunos registros de estructura pueden no tener descripción)
+        if not record.get('descripcion', '').strip():
+            # Verificar que al menos tenga un código NCM bien formado
+            if not NCMTableProcessor.is_ncm_code(ncm_code):
+                return False
+            
+        return True
 
 class NCMExtractorHybridFix:
     """Extractor HÍBRIDO - Motor que funciona + Correcciones críticas"""
@@ -243,7 +373,7 @@ class NCMExtractorHybridFix:
                 
                 # Tratar de identificar la estructura
                 record = self.table_processor.identify_row_structure(parts)
-                if record:
+                if record and self.table_processor.validate_extracted_record(record):
                     records.append(record)
         
         return records
@@ -265,7 +395,7 @@ class NCMExtractorHybridFix:
                                 cleaned_cells = [cell.strip() for cell in row if cell and cell.strip()]
                                 if cleaned_cells:
                                     record = self.table_processor.identify_row_structure(cleaned_cells)
-                                    if record:
+                                    if record and self.table_processor.validate_extracted_record(record):
                                         all_records.append(record)
         except Exception as e:
             print(f"⚠️  Estrategia 1 falló en página {page_num}: {e}")
@@ -288,7 +418,7 @@ class NCMExtractorHybridFix:
                                     cleaned_cells = [cell.strip() for cell in row if cell and cell.strip()]
                                     if cleaned_cells:
                                         record = self.table_processor.identify_row_structure(cleaned_cells)
-                                        if record:
+                                        if record and self.table_processor.validate_extracted_record(record):
                                             all_records.append(record)
             except Exception as e:
                 print(f"⚠️  Estrategia 2 falló en página {page_num}: {e}")
@@ -489,7 +619,7 @@ class NCMExtractorHybridFix:
         json_file = self.results_dir / f"dataset_ncm_HYBRID_FIXED_{timestamp}.json"
         consolidated_json = {
             "metadata": {
-                "version": "hybrid_fix_v1.0",
+                "version": "hybrid_fix_v2.0_intelligent_classification",
                 "total_records": len(all_results),
                 "extraction_method": "hybrid_pdfplumber_fixed",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -502,7 +632,14 @@ class NCMExtractorHybridFix:
                     "corrected_chapter_range_1_to_97", 
                     "added_record_type_classification",
                     "improved_hierarchy_validation",
-                    "enhanced_fiscal_data_detection"
+                    "enhanced_fiscal_data_detection",
+                    "CRITICAL_FIX_tax_value_parsing_confusion_with_ncm_codes",
+                    "comprehensive_record_validation",
+                    "enhanced_decimal_filtering",
+                    "INTELLIGENT_CLASSIFICATION_v2.0",
+                    "context_aware_ncm_reference_detection",
+                    "semantic_tax_validation",
+                    "pattern_based_ncm_recognition"
                 ]
             },
             "records": all_results
@@ -551,7 +688,8 @@ class NCMExtractorHybridFix:
 
 def main():
     """Función principal HÍBRIDA CORREGIDA"""
-    print("🔧 EXTRACTOR NCM - VERSIÓN HÍBRIDA CORREGIDA")
+    print("🔧 EXTRACTOR NCM - VERSIÓN HÍBRIDA INTELIGENTE v2.0")
+    print("🧠 CLASIFICACIÓN INTELIGENTE: Detección semántica de referencias NCM vs impuestos reales")
     print("Motor funcional + Correcciones críticas + Rango 1-97")
     print("-" * 60)
     
