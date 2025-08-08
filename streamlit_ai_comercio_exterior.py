@@ -2598,7 +2598,10 @@ weight: {peso_facturable_kg:.2f} kg""")
                     'cost_breakdown': {},  # API unificada maneja esto diferente
                     'test_mode': True,
                     'service': metodo_calculo,
-                    'transit_days': best_quote.transit_days if unified_result["success"] else 2
+                    'transit_days': best_quote.transit_days if unified_result["success"] else 2,
+                    # Agregar opciones de flete para mostrar en la UI
+                    'all_freight_quotes': all_quotes if unified_result["success"] else [],
+                    'best_freight_quote': best_quote._asdict() if unified_result["success"] and hasattr(best_quote, '_asdict') else best_quote if unified_result["success"] else {}
                 }
                     
             except Exception as e:
@@ -2710,7 +2713,10 @@ weight: {peso_facturable_kg:.2f} kg""")
                 'dhl_argentina_taxes': 0.0,
                 'dhl_insurance_included': False,
                 'dhl_taxes_included': False
-            }
+            },
+            # NUEVO: Opciones de flete para mostrar en la UI
+            "all_freight_quotes": result_session_data.get('all_freight_quotes', []) if 'result_session_data' in locals() else [],
+            "best_freight_quote": result_session_data.get('best_freight_quote', {}) if 'result_session_data' in locals() else {}
         }
         log_flow_step("FIN_ANALISIS", "SUCCESS", {"landed_cost": landed_cost})
         st.rerun()
@@ -2806,6 +2812,124 @@ def render_product_summary():
             if product.url:
                 st.link_button("Ver producto original en Alibaba ↗️", product.url, use_container_width=True)
 
+def render_freight_options_section(result):
+    """
+    Muestra las opciones de flete disponibles y la seleccionada de forma clara y eficiente.
+    Sigue buenas prácticas de programación con código modular y reutilizable.
+    """
+    # Extraer datos de flete del resultado
+    all_quotes = result.get('all_freight_quotes', [])
+    best_quote = result.get('best_freight_quote', {})
+    shipping_details = result.get('shipping_details', {})
+    
+    if not all_quotes:
+        # Si no hay opciones múltiples, mostrar solo información básica
+        st.markdown("#### 🚚 Información de Flete")
+        metodo_flete = shipping_details.get('metodo_calculo_flete', 'Método no especificado')
+        st.info(f"**Método de cálculo**: {metodo_flete}")
+        return
+    
+    st.markdown("#### 🚚 Opciones de Flete Disponibles")
+    
+    # Crear DataFrame con todas las opciones
+    freight_data = []
+    for i, quote in enumerate(all_quotes):
+        # Determinar si es la opción seleccionada
+        is_selected = (
+            quote.get('carrier', '') == best_quote.get('carrier', '') and
+            quote.get('cost_usd', 0) == best_quote.get('cost_usd', 0)
+        )
+        
+        freight_data.append({
+            "Seleccionado": "✅" if is_selected else "⚪",
+            "Carrier": quote.get('carrier', 'N/A'),
+            "Servicio": quote.get('service_name', 'N/A'),
+            "Costo USD": f"${quote.get('cost_usd', 0):.2f}",
+            "Tiempo de Tránsito": f"{quote.get('transit_days', 'N/A')} días" if quote.get('transit_days') else 'N/A',
+            "Método": quote.get('method', 'N/A'),
+            "Estado": "🟢 Exitoso" if quote.get('success', False) else "🔴 Error"
+        })
+    
+    if freight_data:
+        df_freight = pd.DataFrame(freight_data)
+        
+        # Mostrar tabla con estilo
+        st.dataframe(
+            df_freight,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Seleccionado": st.column_config.TextColumn("", width="small"),
+                "Carrier": st.column_config.TextColumn("Transportista", width="medium"),
+                "Servicio": st.column_config.TextColumn("Servicio", width="medium"),
+                "Costo USD": st.column_config.TextColumn("Costo", width="small"),
+                "Tiempo de Tránsito": st.column_config.TextColumn("Tiempo", width="small"),
+                "Método": st.column_config.TextColumn("Método", width="medium"),
+                "Estado": st.column_config.TextColumn("Estado", width="small")
+            }
+        )
+        
+        # Mostrar información adicional de la opción seleccionada
+        if best_quote:
+            _render_selected_freight_details(best_quote, shipping_details)
+    else:
+        st.warning("⚠️ No se encontraron opciones de flete disponibles")
+
+def _render_selected_freight_details(best_quote, shipping_details):
+    """
+    Función auxiliar para mostrar detalles de la opción de flete seleccionada.
+    Mantiene el código modular y reutilizable.
+    """
+    st.markdown("##### 🏆 Detalles de la Opción Seleccionada")
+    
+    # Métricas de la opción seleccionada
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.metric(
+            "🚛 Transportista",
+            best_quote.get('carrier', 'N/A'),
+            help="Empresa de transporte seleccionada"
+        )
+    
+    with col2:
+        st.metric(
+            "📦 Servicio",
+            best_quote.get('service_name', 'N/A'),
+            help="Tipo de servicio de envío"
+        )
+    
+    with col3:
+        cost = best_quote.get('cost_usd', 0)
+        st.metric(
+            "💰 Costo",
+            f"${cost:.2f} USD",
+            help="Costo total del flete"
+        )
+    
+    with col4:
+        transit_days = best_quote.get('transit_days', 'N/A')
+        st.metric(
+            "⏱️ Tiempo",
+            f"{transit_days} días" if transit_days != 'N/A' else 'N/A',
+            help="Tiempo estimado de tránsito"
+        )
+    
+    # Información adicional si está disponible
+    raw_response = best_quote.get('raw_response', {})
+    if raw_response:
+        with st.expander("🔍 Ver detalles técnicos de la cotización"):
+            st.json(raw_response)
+    
+    # Información del método de cálculo
+    method = best_quote.get('method', '')
+    if 'api' in method.lower():
+        st.success("✅ **Cotización obtenida de API en tiempo real**")
+    elif 'fallback' in method.lower():
+        st.warning("⚠️ **Cotización obtenida de tarifas de respaldo**")
+    elif 'estimation' in method.lower():
+        st.info("📊 **Cotización estimativa**")
+
 def show_calculator_table():
     result = st.session_state.result
     
@@ -2840,6 +2964,9 @@ def show_calculator_table():
             value=f"${flete_total:.2f} USD",
             help=f"Costo total del flete internacional para toda la cantidad (Método: {metodo_flete})"
         )
+    
+    # Mostrar opciones de flete si están disponibles
+    render_freight_options_section(result)
     
     # Información adicional del envío si está disponible
     if shipping_details.get('peso_facturable_kg', 0) > 0:
