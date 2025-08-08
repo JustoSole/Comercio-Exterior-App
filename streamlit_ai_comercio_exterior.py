@@ -25,7 +25,7 @@ import traceback
 import os
 import time as time_module
 import requests
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 import re
 import asyncio
 import io
@@ -490,7 +490,7 @@ def initialize_session_state():
         }
     if 'destination_details' not in st.session_state:
         st.session_state.destination_details = {
-            "postalCode": "1440",  # Código que funciona con DHL test
+            "postalCode": "C1000",  # Código postal de Buenos Aires (será normalizado automáticamente)
             "cityName": "CAPITAL FEDERAL",
             "countryCode": "AR",
             "addressLine1": "addres1",  # Formato que funciona con DHL test
@@ -506,6 +506,12 @@ def initialize_session_state():
     # Inicializar información de debug NCM
     if 'ncm_debug_info' not in st.session_state:
         st.session_state.ncm_debug_info = {}
+    # Configuración por defecto para la tab de margen
+    if 'margin_config' not in st.session_state:
+        st.session_state.margin_config = {
+            "precio_venta_unit_usd": 0.0,
+            "comision_venta_pct": 0.0
+        }
 
 def debug_log(message, data=None, level="INFO"):
     """Función de debug optimizada con control de rendimiento"""
@@ -1571,8 +1577,8 @@ def render_editable_product_form():
         
         with col3:
             if dest_country == "AR":
-                dest_postal = st.text_input("Código Postal", value="1440", key="main_dest_postal", 
-                                          help="Código que funciona con DHL test")
+                dest_postal = st.text_input("Código Postal", value="C1000", key="main_dest_postal", 
+                                          help="Código postal de Buenos Aires (se normaliza automáticamente para APIs)")
             else:
                 dest_postal = st.text_input("Código Postal", value="00000", key="main_dest_postal_generic")
     
@@ -1631,6 +1637,17 @@ def render_editable_product_form():
 
 def fetch_and_populate_from_url(url):
     """Extrae datos de Alibaba y los carga en el formulario editable."""
+    # Normalizar subdominios de Alibaba (spanish., french., m., etc.) -> www.alibaba.com
+    try:
+        parsed = urlparse(url.strip())
+        hostname = parsed.hostname or ""
+        if hostname.endswith(".alibaba.com") and hostname != "www.alibaba.com":
+            normalized_netloc = "www.alibaba.com"
+            parsed = parsed._replace(netloc=normalized_netloc)
+            url = urlunparse(parsed)
+    except Exception:
+        pass
+
     log_flow_step("FETCH_FROM_URL", "STARTED", {"url": url})
     clear_debug_data()
     st.session_state.result = None
@@ -1826,10 +1843,21 @@ def render_main_calculator():
             key="url_input"
         )
         if st.button("🔍 Extraer Datos", type="primary", use_container_width=True):
-            if not url_alibaba or not url_alibaba.startswith("https://www.alibaba.com/product-detail/"):
+            # Normalizar la URL para que use www.alibaba.com
+            normalized_url = url_alibaba.strip() if url_alibaba else ""
+            try:
+                parsed = urlparse(normalized_url)
+                host = (parsed.hostname or "").lower()
+                if host.endswith(".alibaba.com") and host != "www.alibaba.com":
+                    parsed = parsed._replace(netloc="www.alibaba.com")
+                    normalized_url = urlunparse(parsed)
+            except Exception:
+                pass
+
+            if not normalized_url or not normalized_url.startswith("https://www.alibaba.com/product-detail/"):
                 st.error("❌ Ingresa una URL de Alibaba válida.")
             else:
-                fetch_and_populate_from_url(url_alibaba)
+                fetch_and_populate_from_url(normalized_url)
     else: # Modo Manual
         if st.button("📝 Cargar Formulario Manual", use_container_width=True):
             st.session_state.data_input_step_completed = True
@@ -1896,12 +1924,15 @@ def main():
     """, unsafe_allow_html=True)
     
     # Crear tabs principales
-    tab1, tab2 = st.tabs(["📊 Calculadora Principal", "🔍 Debug & Análisis"])
+    tab1, tab2, tab3 = st.tabs(["📊 Calculadora Principal", "💹 Margen y Precio", "🔍 Debug & Análisis"])
     
     with tab1:
         render_main_calculator()
     
     with tab2:
+        render_margin_tab()
+    
+    with tab3:
         render_debug_tab()
 
 def validate_and_select_best_image(images_list, logger=None):
@@ -2132,6 +2163,21 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
     origin_details = st.session_state.get('origin_details')
     destination_details = st.session_state.get('destination_details')
     
+    # Debug: Mostrar las direcciones que se están usando
+    if st.session_state.get('debug_mode', False):
+        with st.expander("🔍 **Debug: Direcciones de envío**", expanded=False):
+            col_debug1, col_debug2 = st.columns(2)
+            with col_debug1:
+                st.json({
+                    "origin_details": origin_details,
+                    "entry_mode": st.session_state.entry_mode
+                })
+            with col_debug2:
+                st.json({
+                    "destination_details": destination_details,
+                    "debug_mode": st.session_state.get('debug_mode', False)
+                })
+    
     log_flow_step("INICIO_ANALISIS", "STARTED", {
         "configuracion": {
             "tipo_importador": tipo_importador, "destino_importacion": destino_importacion,
@@ -2358,75 +2404,201 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
         metodo_calculo = "Sin datos"
         
         if tipo_flete == "Courier (Aéreo)":
-            # NUEVO: Usar servicio DHL integrado con fallbacks automáticos
+            # NUEVO: Usar API unificada que compara FedEx + DHL y elige la mejor opción
             try:
-                # Construir dimensiones para DHL
+                from carriers_apis_conections.unified_shipping_api import get_cheapest_shipping_rate
+                
+                # Construir dimensiones
                 dimensions_cm_dict = {
                     "length": dims.get('length', 25),
                     "width": dims.get('width', 35), 
                     "height": dims.get('height', 15)
                 }
                 
-                # Calcular con servicio DHL integrado usando direcciones personalizadas
-                dhl_result = st.session_state.dhl_service.calculate_freight_with_fallback(
+                # Obtener mejor cotización comparando FedEx y DHL usando direcciones del session state
+                unified_result = get_cheapest_shipping_rate(
                     weight_kg=peso_facturable_kg,
-                    dimensions_cm=dimensions_cm_dict,
-                    origin_details=origin_details,
-                    destination_details=destination_details,
-                    shipping_datetime=st.session_state.get('planned_shipping_datetime')
+                    origin_country=origin_details.get('countryCode', 'CN'),  # Usar país de origen real (China)
+                    origin_postal=origin_details.get('postalCode', '518000'),  # Usar código postal real
+                    dest_country=destination_details.get('countryCode', 'AR'),
+                    dest_postal=destination_details.get('postalCode', 'C1000'),
+                    test_mode=True,
+                    debug=False
                 )
                 
-                # Registrar la respuesta completa en la API responses
-                if 'raw_response' in dhl_result:
-                    log_api_call("DHL_API", dimensions_cm_dict, dhl_result['raw_response'], dhl_result['success'])
-                
-                # Extraer costos detallados si están disponibles
-                insurance_cost = 0.0
-                argentina_taxes = 0.0
-                
-                if 'cost_breakdown' in dhl_result:
-                    cost_breakdown = dhl_result['cost_breakdown']
-                    insurance_cost = cost_breakdown.get('insurance_cost', 0.0)
-                    argentina_taxes = cost_breakdown.get('argentina_taxes', 0.0)
+                if unified_result["success"]:
+                    best_quote = unified_result["best_quote"]
+                    all_quotes = unified_result["all_quotes"]
                     
-                    debug_log(f"🛡️ Seguro incluido en DHL: ${insurance_cost:.2f} USD")
-                    debug_log(f"🏛️ Impuestos argentinos incluidos en DHL: ${argentina_taxes:.2f} USD")
-                
-                costo_flete_total_usd = dhl_result["cost_usd"]
-                metodo_calculo = f"DHL {dhl_result['method']}"
-                
-                # Logging según el método usado
-                if dhl_result["method"] == "dhl_api_real":
-                    debug_log(f"✅ Flete aéreo calculado con API real de DHL: ${costo_flete_total_usd:.2f}", level="SUCCESS")
-                    st.success(f"🌐 Cotización real de DHL: ${costo_flete_total_usd:.2f} USD")
+                    costo_flete_total_usd = best_quote.cost_usd
+                    metodo_calculo = f"{best_quote.carrier} - {best_quote.service_name}"
                     
-                    # Mostrar desglose si está disponible
-                    if 'cost_breakdown' in dhl_result:
-                        breakdown = dhl_result['cost_breakdown']
-                        st.info(f"💼 Incluye: Servicio ${breakdown.get('base_service_cost', 0):.2f} + Combustible ${breakdown.get('fuel_surcharge', 0):.2f}" +
-                               (f" + Seguro ${breakdown.get('insurance_cost', 0):.2f}" if breakdown.get('insurance_cost', 0) > 0 else "") +
-                               (f" + Impuestos AR ${breakdown.get('argentina_taxes', 0):.2f}" if breakdown.get('argentina_taxes', 0) > 0 else ""))
+                    debug_log(f"✅ Mejor cotización: {best_quote.carrier} ${best_quote.cost_usd:.2f} USD", level="SUCCESS")
+                    
+                    # Mostrar resultado principal con información detallada
+                    st.success(f"🏆 **Mejor opción seleccionada: {best_quote.carrier}** - ${best_quote.cost_usd:.2f} USD")
+                    
+                    # Información detallada del envío seleccionado
+                    col_best1, col_best2, col_best3 = st.columns(3)
+                    with col_best1:
+                        st.metric("📦 Servicio", best_quote.service_name)
+                    with col_best2:
+                        st.metric("⏰ Tiempo de tránsito", f"{best_quote.transit_days or 'N/A'} días")
+                    with col_best3:
+                        st.metric("💰 Costo total", f"${best_quote.cost_usd:.2f} USD")
+                    
+                    # Información detallada de direcciones y APIs
+                    col_route1, col_route2 = st.columns(2)
+                    with col_route1:
+                        st.info(f"📍 **Origen**: {origin_details.get('countryCode', 'CN')} - {origin_details.get('cityName', 'SHENZHEN')} ({origin_details.get('postalCode', '518000')})")
+                    with col_route2:
+                        st.info(f"🎯 **Destino**: {destination_details.get('countryCode', 'AR')} - {destination_details.get('cityName', 'CAPITAL FEDERAL')} ({destination_details.get('postalCode', 'C1000')})")
+                    
+                    # Información técnica de la consulta
+                    with st.expander("🔧 **Detalles técnicos de la consulta**", expanded=False):
+                        st.write("**Parámetros enviados a las APIs:**")
+                        col_tech1, col_tech2 = st.columns(2)
+                        with col_tech1:
+                            st.code(f"""FedEx API:
+origin_country: {origin_details.get('countryCode', 'CN')}
+origin_postal: {origin_details.get('postalCode', '518000')}
+dest_country: {destination_details.get('countryCode', 'AR')}
+dest_postal: {destination_details.get('postalCode', 'C1000')}
+weight: {peso_facturable_kg:.2f} kg""")
+                        with col_tech2:
+                            # Mostrar códigos postales normalizados para DHL
+                            from carriers_apis_conections.unified_shipping_api import UnifiedShippingAPI
+                            api_temp = UnifiedShippingAPI()
+                            dest_postal_norm = api_temp._normalize_postal_code(destination_details.get('postalCode', 'C1000'), destination_details.get('countryCode', 'AR'))
+                            origin_postal_norm = api_temp._normalize_postal_code(origin_details.get('postalCode', '518000'), origin_details.get('countryCode', 'CN'))
+                            st.code(f"""DHL API (normalizado):
+origin_country: {origin_details.get('countryCode', 'CN')}
+origin_postal: {origin_postal_norm}
+dest_country: {destination_details.get('countryCode', 'AR')}
+dest_postal: {dest_postal_norm}
+weight: {peso_facturable_kg:.2f} kg""")
+                    
+                    # Mostrar comparación de todas las opciones
+                    with st.expander("📊 **Ver todas las opciones disponibles y comparar carriers**", expanded=False):
+                        col1, col2 = st.columns(2)
                         
-                elif dhl_result["method"] == "fallback_rates":
-                    debug_log(f"✅ Flete aéreo con tarifas de fallback DHL: ${costo_flete_total_usd:.2f}", level="WARNING")
-                    st.info(f"📊 Cotización con tarifas de referencia: ${costo_flete_total_usd:.2f} USD")
-                else:
-                    debug_log(f"✅ Flete aéreo con estimación básica: ${costo_flete_total_usd:.2f}", level="WARNING")
-                    st.warning(f"📈 Cotización estimada: ${costo_flete_total_usd:.2f} USD")
-                
-                if dhl_result.get("note"):
-                    st.caption(f"ℹ️ {dhl_result['note']}")
+                        # Mostrar FedEx options
+                        with col1:
+                            st.markdown("### 🚀 **FedEx**")
+                            fedex_quotes = all_quotes.get("FedEx", [])
+                            if fedex_quotes:
+                                for i, quote in enumerate(fedex_quotes[:5], 1):  # Top 5
+                                    if quote.success:
+                                        is_selected = quote.carrier == best_quote.carrier and abs(quote.cost_usd - best_quote.cost_usd) < 0.01
+                                        icon = "🏆" if is_selected else "📦"
+                                        style = "background-color: #e8f5e8; padding: 10px; border-radius: 5px; margin: 5px 0;" if is_selected else ""
+                                        
+                                        rate_type_text = f" ({quote.rate_type})" if hasattr(quote, 'rate_type') and quote.rate_type != "Unknown" else ""
+                                        
+                                        st.markdown(f"""
+                                        <div style="{style}">
+                                            {icon} <strong>${quote.cost_usd:.2f} USD</strong> - {quote.service_name}{rate_type_text}<br>
+                                            <small>⏰ {quote.transit_days or 'N/A'} días de tránsito</small>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                    else:
+                                        st.write(f"❌ Error: {quote.error_message}")
+                            else:
+                                st.write("❌ No disponible")
+                        
+                        # Mostrar DHL options  
+                        with col2:
+                            st.markdown("### 📦 **DHL**")
+                            dhl_quotes = all_quotes.get("DHL", [])
+                            if dhl_quotes:
+                                for i, quote in enumerate(dhl_quotes, 1):
+                                    if quote.success:
+                                        is_selected = quote.carrier == best_quote.carrier and abs(quote.cost_usd - best_quote.cost_usd) < 0.01
+                                        icon = "🏆" if is_selected else "📦"
+                                        style = "background-color: #e8f5e8; padding: 10px; border-radius: 5px; margin: 5px 0;" if is_selected else ""
+                                        
+                                        rate_type_text = f" ({quote.rate_type})" if hasattr(quote, 'rate_type') and quote.rate_type != "Unknown" else ""
+                                        
+                                        st.markdown(f"""
+                                        <div style="{style}">
+                                            {icon} <strong>${quote.cost_usd:.2f} USD</strong> - {quote.service_name}{rate_type_text}<br>
+                                            <small>⏰ {quote.transit_days or 'N/A'} días de tránsito</small>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                    else:
+                                        st.write(f"❌ Error: {quote.error_message}")
+                            else:
+                                st.write("❌ No disponible")
                     
-                # Almacenar información completa del resultado DHL para uso posterior
+                    # Log todas las respuestas para debug
+                    log_api_call("UNIFIED_SHIPPING", {"weight": peso_facturable_kg}, unified_result, True)
+                    
+                    # Variables para compatibilidad con código existente
+                    insurance_cost = 0.0
+                    argentina_taxes = 0.0
+                    
+                else:
+                    # Fallback: usar solo DHL si la API unificada falla
+                    debug_log(f"⚠️ API unificada falló, usando DHL como fallback: {unified_result.get('error')}", level="WARNING")
+                    st.warning("⚠️ Comparación de carriers no disponible, usando DHL...")
+                    
+                    # Usar direcciones reales del session state también en fallback DHL
+                    fallback_origin = origin_details or {
+                        "postalCode": "518000",
+                        "cityName": "SHENZHEN",
+                        "countryCode": "CN",
+                        "addressLine1": "address1",
+                        "addressLine2": "address2",
+                        "addressLine3": "address3"
+                    }
+                    fallback_destination = destination_details or {
+                        "postalCode": "C1000",
+                        "cityName": "BUENOS AIRES",
+                        "countryCode": "AR",
+                        "addressLine1": "address1",
+                        "addressLine2": "address2",
+                        "addressLine3": "address3"
+                    }
+                    
+                    # Usar servicio DHL original como fallback
+                    dhl_result = st.session_state.dhl_service.calculate_freight_with_fallback(
+                        weight_kg=peso_facturable_kg,
+                        dimensions_cm=dimensions_cm_dict,
+                        origin_details=fallback_origin,
+                        destination_details=fallback_destination,
+                        shipping_datetime=st.session_state.get('planned_shipping_datetime')
+                    )
+                    
+                    costo_flete_total_usd = dhl_result["cost_usd"]
+                    metodo_calculo = f"DHL {dhl_result['method']} (fallback)"
+                    
+                    # Extraer costos detallados si están disponibles
+                    insurance_cost = 0.0
+                    argentina_taxes = 0.0
+                    
+                    if 'cost_breakdown' in dhl_result:
+                        cost_breakdown = dhl_result['cost_breakdown']
+                        insurance_cost = cost_breakdown.get('insurance_cost', 0.0)
+                        argentina_taxes = cost_breakdown.get('argentina_taxes', 0.0)
+                    
+                    if dhl_result["success"]:
+                        st.info(f"📦 DHL: ${costo_flete_total_usd:.2f} USD")
+                    else:
+                        st.error(f"❌ Error en cotización: {dhl_result.get('error')}")
+                        costo_flete_total_usd = peso_facturable_kg * 45  # Estimación básica
+                        metodo_calculo = "Estimación básica"
+                        st.warning(f"📈 Usando estimación: ${costo_flete_total_usd:.2f} USD")
+                    
+                # Almacenar información completa del resultado para uso posterior
                 result_session_data = {
                     'dhl_insurance_cost': insurance_cost,
                     'dhl_argentina_taxes': argentina_taxes,
-                    'dhl_insurance_included': dhl_result.get('insurance_included', False),
-                    'dhl_taxes_included': dhl_result.get('taxes_included', False),
-                    'cost_breakdown': dhl_result.get('cost_breakdown', {}),
-                    'test_mode': dhl_result.get('test_mode', True),
-                    'service': dhl_result.get('service', 'N/A'),
-                    'transit_days': dhl_result.get('transit_days', 2)
+                    'dhl_insurance_included': False,  # API unificada no tiene esta info
+                    'dhl_taxes_included': False,  # API unificada no tiene esta info
+                    'cost_breakdown': {},  # API unificada maneja esto diferente
+                    'test_mode': True,
+                    'service': metodo_calculo,
+                    'transit_days': best_quote.transit_days if unified_result["success"] else 2
                 }
                     
             except Exception as e:
@@ -2842,6 +3014,75 @@ def show_calculator_table():
             else:
                 st.error("❌ Error al subir los datos a Google Sheets")
 
+def render_margin_tab():
+    """Renderiza la pestaña de margen y precio de venta."""
+    st.markdown("## 💹 Margen y Precio de Venta")
+    if 'result' not in st.session_state or not st.session_state.result:
+        st.info("Primero realiza un cálculo en la pestaña 'Calculadora Principal'.")
+        return
+
+    result = st.session_state.result
+    qty = int(result['configuracion'].get('import_quantity', 1))
+    landed_unit = float(result.get('landed_cost', 0.0))
+    fob_unit = float(result.get('precio_base', 0.0))
+
+    top1, top2, top3 = st.columns(3)
+    top1.metric("Landed Cost Unit.", f"${landed_unit:.2f} USD")
+    top2.metric("Cantidad", f"{qty} u")
+    top3.metric("FOB Unit.", f"${fob_unit:.2f} USD")
+
+    st.divider()
+
+    default_pv = float(st.session_state.margin_config.get('precio_venta_unit_usd', max(landed_unit * 1.3, 0.0)))
+    default_comm = float(st.session_state.margin_config.get('comision_venta_pct', 10.0))
+
+    c1, c2 = st.columns(2)
+    with c1:
+        pv_unit = st.number_input(
+            "Precio de venta unitario (USD)",
+            min_value=0.0,
+            value=default_pv,
+            step=1.0,
+            key="pv_unit_input"
+        )
+    with c2:
+        comm_pct = st.number_input(
+            "Comisión de venta (%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=default_comm,
+            step=0.5,
+            key="comm_pct_input"
+        )
+
+    # Guardar en sesión
+    st.session_state.margin_config['precio_venta_unit_usd'] = pv_unit
+    st.session_state.margin_config['comision_venta_pct'] = comm_pct
+
+    commission_unit = pv_unit * (comm_pct / 100.0)
+    net_revenue_unit = max(pv_unit - commission_unit, 0.0)
+    margin_unit = net_revenue_unit - landed_unit
+    margin_pct_over_price = (margin_unit / pv_unit * 100.0) if pv_unit > 0 else 0.0
+    markup_over_cost = (margin_unit / landed_unit * 100.0) if landed_unit > 0 else 0.0
+    breakeven_price = landed_unit / (1 - (comm_pct / 100.0)) if (1 - (comm_pct / 100.0)) > 0 else 0.0
+
+    st.markdown("### Resultados por Unidad")
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Comisión/Unit.", f"${commission_unit:.2f}")
+    r2.metric("Ingreso Neto/Unit.", f"${net_revenue_unit:.2f}")
+    r3.metric("Margen/Unit.", f"${margin_unit:.2f}")
+    r4.metric("Margen % sobre PV", f"{margin_pct_over_price:.1f}%")
+
+    k1, k2 = st.columns(2)
+    k1.metric("Markup % sobre Costo", f"{markup_over_cost:.1f}%")
+    k2.metric("Precio Breakeven (PV)", f"${breakeven_price:.2f}")
+
+    st.markdown("### Totales")
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Ingreso Total", f"${(pv_unit * qty):,.2f}")
+    t2.metric("Comisión Total", f"${(commission_unit * qty):,.2f}")
+    t3.metric("Ganancia Total", f"${(margin_unit * qty):,.2f}")
+
 def prepare_export_data(result):
     """
     Preparar los datos de la cotización para exportar a Google Sheets.
@@ -3040,6 +3281,10 @@ def prepare_export_data(result):
         "costo_flete_unitario": round(float(flete_unitario), 2),  # Para referencia
         "honorarios_despachante": round(float(honorarios_total), 2),
         "total_landed_cost": round(float(total_landed_cost), 2),
+        "landed_cost_unit": round(float(landed_cost), 2),
+        # Campos de margen (cuando haya configuración cargada)
+        "precio_venta_unit": round(float(st.session_state.margin_config.get("precio_venta_unit_usd", 0.0)), 2),
+        "comision_venta_pct": round(float(st.session_state.margin_config.get("comision_venta_pct", 0.0)) / 100.0, 4),
         # Eliminado: No exportar ARS
         "metodo_flete": str(metodo_flete),
         "origen": str(origen),
@@ -3680,73 +3925,78 @@ def recalculate_and_update_session(result, new_price, new_flete_type, selected_o
         metodo_calculo = "Sin datos"
         
         if new_flete_type == "Courier (Aéreo)":
-            # NUEVO: Usar servicio DHL integrado en recálculo
+            # NUEVO: Usar API unificada también en recálculo
             try:
+                from carriers_apis_conections.unified_shipping_api import get_cheapest_shipping_rate
+                
                 dimensions_cm_dict = {
                     "length": dims.get('length', 25),
                     "width": dims.get('width', 35), 
                     "height": dims.get('height', 15)
                 }
                 
-                dhl_result = st.session_state.dhl_service.calculate_freight_with_fallback(
+                # Usar API unificada en recálculo también con direcciones reales
+                unified_result = get_cheapest_shipping_rate(
                     weight_kg=peso_facturable_kg,
-                    dimensions_cm=dimensions_cm_dict,
-                    origin_details=origin_details,
-                    destination_details=destination_details,
-                    shipping_datetime=st.session_state.get('planned_shipping_datetime')
+                    origin_country=st.session_state.origin_details.get('countryCode', 'CN'),
+                    origin_postal=st.session_state.origin_details.get('postalCode', '518000'),
+                    dest_country=st.session_state.destination_details.get('countryCode', 'AR'),
+                    dest_postal=st.session_state.destination_details.get('postalCode', 'C1000'),
+                    test_mode=True,
+                    debug=False
                 )
                 
-                # Registrar la respuesta completa en la API responses
-                if 'raw_response' in dhl_result:
-                    log_api_call("DHL_API", dimensions_cm_dict, dhl_result['raw_response'], dhl_result['success'])
+                if unified_result["success"]:
+                    best_quote = unified_result["best_quote"]
+                    flete_costo_total = best_quote.cost_usd
+                    metodo_calculo = f"{best_quote.carrier} - {best_quote.service_name} (recalc)"
+                else:
+                    # Fallback a DHL solo si la API unificada falla
+                    # Definir direcciones por defecto para DHL
+                    origin_details = {
+                        "postalCode": "38125",
+                        "cityName": "MEMPHIS",
+                        "countryCode": "US",
+                        "addressLine1": "address1",
+                        "addressLine2": "address2",
+                        "addressLine3": "address3"
+                    }
+                    destination_details = {
+                        "postalCode": "C1000",
+                        "cityName": "BUENOS AIRES",
+                        "countryCode": "AR",
+                        "addressLine1": "address1",
+                        "addressLine2": "address2",
+                        "addressLine3": "address3"
+                    }
+                    
+                    dhl_result = st.session_state.dhl_service.calculate_freight_with_fallback(
+                        weight_kg=peso_facturable_kg,
+                        dimensions_cm=dimensions_cm_dict,
+                        origin_details=origin_details,
+                        destination_details=destination_details,
+                        shipping_datetime=st.session_state.get('planned_shipping_datetime')
+                    )
+                    flete_costo_total = dhl_result["cost_usd"]
+                    metodo_calculo = f"DHL {dhl_result['method']} (fallback recalc)"
                 
-                # Extraer costos detallados si están disponibles
+                # Mantener variables para compatibilidad
                 insurance_cost = 0.0
                 argentina_taxes = 0.0
                 
-                if 'cost_breakdown' in dhl_result:
-                    cost_breakdown = dhl_result['cost_breakdown']
-                    insurance_cost = cost_breakdown.get('insurance_cost', 0.0)
-                    argentina_taxes = cost_breakdown.get('argentina_taxes', 0.0)
-                    
-                    debug_log(f"🛡️ Seguro incluido en DHL: ${insurance_cost:.2f} USD")
-                    debug_log(f"🏛️ Impuestos argentinos incluidos en DHL: ${argentina_taxes:.2f} USD")
+                # Usar flete_costo_total que ya se asignó arriba
+                costo_flete_total_usd = flete_costo_total
                 
-                costo_flete_total_usd = dhl_result["cost_usd"]
-                metodo_calculo = f"DHL {dhl_result['method']}"
-                
-                # Logging según el método usado
-                if dhl_result["method"] == "dhl_api_real":
-                    debug_log(f"✅ Flete aéreo calculado con API real de DHL: ${costo_flete_total_usd:.2f}", level="SUCCESS")
-                    st.success(f"🌐 Cotización real de DHL: ${costo_flete_total_usd:.2f} USD")
-                    
-                    # Mostrar desglose si está disponible
-                    if 'cost_breakdown' in dhl_result:
-                        breakdown = dhl_result['cost_breakdown']
-                        st.info(f"💼 Incluye: Servicio ${breakdown.get('base_service_cost', 0):.2f} + Combustible ${breakdown.get('fuel_surcharge', 0):.2f}" +
-                               (f" + Seguro ${breakdown.get('insurance_cost', 0):.2f}" if breakdown.get('insurance_cost', 0) > 0 else "") +
-                               (f" + Impuestos AR ${breakdown.get('argentina_taxes', 0):.2f}" if breakdown.get('argentina_taxes', 0) > 0 else ""))
-                        
-                elif dhl_result["method"] == "fallback_rates":
-                    debug_log(f"✅ Flete aéreo con tarifas de fallback DHL: ${costo_flete_total_usd:.2f}", level="WARNING")
-                    st.info(f"📊 Cotización con tarifas de referencia: ${costo_flete_total_usd:.2f} USD")
-                else:
-                    debug_log(f"✅ Flete aéreo con estimación básica: ${costo_flete_total_usd:.2f}", level="WARNING")
-                    st.warning(f"📈 Cotización estimada: ${costo_flete_total_usd:.2f} USD")
-                
-                if dhl_result.get("note"):
-                    st.caption(f"ℹ️ {dhl_result['note']}")
-                    
-                # Almacenar información completa del resultado DHL para uso posterior
+                # Almacenar información completa del resultado para uso posterior
                 result_session_data = {
                     'dhl_insurance_cost': insurance_cost,
                     'dhl_argentina_taxes': argentina_taxes,
-                    'dhl_insurance_included': dhl_result.get('insurance_included', False),
-                    'dhl_taxes_included': dhl_result.get('taxes_included', False),
-                    'cost_breakdown': dhl_result.get('cost_breakdown', {}),
-                    'test_mode': dhl_result.get('test_mode', True),
-                    'service': dhl_result.get('service', 'N/A'),
-                    'transit_days': dhl_result.get('transit_days', 2)
+                    'dhl_insurance_included': False,  # API unificada no maneja estos detalles
+                    'dhl_taxes_included': False,  # API unificada no maneja estos detalles  
+                    'cost_breakdown': {},  # API unificada maneja esto diferente
+                    'test_mode': True,
+                    'service': metodo_calculo,
+                    'transit_days': 2  # Default para recálculo
                 }
                     
             except Exception as e:
@@ -4446,7 +4696,10 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
                 "Tipo Embalaje", "Núm. Cajas", "Dimensiones Caja (L×W×H cm)", "Unidades/Caja",
                 "Flete Total USD", "Flete Unit. USD", "Honorarios USD",
                 # Resultado final
-                "Total Landed Cost USD",
+                "Total Landed Cost USD", "Landed Cost Unit USD",
+                # Precio y margen
+                "Precio Venta Unit USD", "Comisión Venta %", "Comisión Unit USD", "Ingreso Neto Unit USD",
+                "Margen Unit USD", "Margen % sobre PV", "Markup % sobre Costo", "Precio Breakeven PV",
                 # Información adicional
                 "Método Flete", "Origen", "Destino", "Tipo Importador"
             ]
@@ -4510,6 +4763,16 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
             "",  # Honorarios USD: FÓRMULA
             # Resultado final  
             "",  # Total Landed Cost USD: FÓRMULA
+            clean_value(data_dict.get("landed_cost_unit", 0)),
+            # Precio y margen (valores base, varias serán fórmulas)
+            clean_value(data_dict.get("precio_venta_unit", 0)),
+            clean_value(data_dict.get("comision_venta_pct", 0)),
+            "",  # Comisión Unit USD: FÓRMULA
+            "",  # Ingreso Neto Unit USD: FÓRMULA
+            "",  # Margen Unit USD: FÓRMULA
+            "",  # Margen % sobre PV: FÓRMULA
+            "",  # Markup % sobre Costo: FÓRMULA
+            "",  # Precio Breakeven PV: FÓRMULA
             # Información adicional
             clean_value(data_dict.get("metodo_flete", "")),
             clean_value(data_dict.get("origen", "")),
@@ -4548,6 +4811,8 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
             # Y=24: Peso Unit, Z=25: Dims Unit, AA=26: Peso Total, AB=27: Volumen, AC=28: Peso Fact
             # AD=29: Tipo Emb, AE=30: Núm Cajas, AF=31: Dims Caja, AG=32: Units/Caja
             # AH=33: Flete Total, AI=34: Flete Unit, AJ=35: Honorarios, AK=36: Landed Cost USD
+            # AL=37: Landed Cost Unit USD, AM=38: PV Unit, AN=39: Comisión %, AO=40: Comisión USD
+            # AP=41: Ingreso Neto Unit, AQ=42: Margen Unit, AR=43: Margen % PV, AS=44: Markup % Costo, AT=45: Breakeven PV
             
             # Preparar fórmulas críticas con batch_update
             formulas_requests = []
@@ -4567,6 +4832,13 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
                 (34, f"=AH{num_rows}/E{num_rows}"),  # AI: Flete Unit = Flete Total ÷ Cantidad
                 (35, f"=G{num_rows}*0,02"),         # AJ: Honorarios = 2% del Subtotal FOB (formato argentino)
                 (36, f"=G{num_rows}+W{num_rows}+AH{num_rows}+AJ{num_rows}"),  # AK: Landed Cost Total
+                # Precio y margen:
+                (40, f"=AM{num_rows}*AN{num_rows}"),  # AO: Comisión USD = PV × Comisión %
+                (41, f"=AM{num_rows}-AO{num_rows}"),  # AP: Ingreso Neto Unit = PV - Comisión
+                (42, f"=AP{num_rows}-AL{num_rows}"),  # AQ: Margen Unit = Neto - Landed Unit
+                (43, f"=IF(AM{num_rows}>0, AQ{num_rows}/AM{num_rows}, 0)"),  # AR: Margen % PV
+                (44, f"=IF(AL{num_rows}>0, AQ{num_rows}/AL{num_rows}, 0)"),  # AS: Markup % Costo
+                (45, f"=IF(1-AN{num_rows}>0, AL{num_rows}/(1-AN{num_rows}), 0)"),  # AT: Breakeven PV
             ]
             
             # Crear requests para batch_update
@@ -4616,6 +4888,13 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
                     (35, f"=AH{num_rows}/E{num_rows}"), # AI: Flete Unit = Flete Total ÷ Cantidad (ACTUALIZADO)
                     (36, f"=G{num_rows}*0,02"),         # AJ: Honorarios = 2% del Subtotal FOB (ACTUALIZADO)
                     (37, f"=G{num_rows}+W{num_rows}+AH{num_rows}+AJ{num_rows}"),  # AK: Landed Cost Total (ACTUALIZADO)
+                    # Precio y margen (1-based): AO=41, AP=42, AQ=43, AR=44, AS=45, AT=46
+                    (41, f"=AM{num_rows}*AN{num_rows}"),  # AO: Comisión USD
+                    (42, f"=AM{num_rows}-AO{num_rows}"),  # AP: Ingreso Neto Unit
+                    (43, f"=AP{num_rows}-AL{num_rows}"),  # AQ: Margen Unit
+                    (44, f"=IF(AM{num_rows}>0, AQ{num_rows}/AM{num_rows}, 0)"),  # AR: Margen % PV
+                    (45, f"=IF(AL{num_rows}>0, AQ{num_rows}/AL{num_rows}, 0)"),  # AS: Markup % Costo
+                    (46, f"=IF(1-AN{num_rows}>0, AL{num_rows}/(1-AN{num_rows}), 0)"),  # AT: Breakeven PV
                 ]
                 
                 successful_formulas = 0
@@ -4657,7 +4936,7 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
         # Aplicar formato a las columnas de moneda
         try:
             # Formato de moneda para columnas USD (precios y costos) - ACTUALIZADO
-            currency_usd_columns = ['F', 'G', 'L', 'N', 'P', 'R', 'T', 'V', 'W', 'X', 'AH', 'AI', 'AJ', 'AK']
+            currency_usd_columns = ['F', 'G', 'L', 'N', 'P', 'R', 'T', 'V', 'W', 'X', 'AH', 'AI', 'AJ', 'AK', 'AL', 'AM', 'AO', 'AP', 'AQ', 'AT']
             for col in currency_usd_columns:
                 try:
                     worksheet.format(f'{col}{num_rows}', {
@@ -4695,7 +4974,7 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
                 pass
             
             # Formato de porcentaje para columnas de %
-            percentage_columns = ['K', 'M', 'O', 'Q', 'S', 'U']
+            percentage_columns = ['K', 'M', 'O', 'Q', 'S', 'U', 'AN', 'AR', 'AS']
             for col in percentage_columns:
                 try:
                     worksheet.format(f'{col}{num_rows}', {

@@ -28,7 +28,7 @@ except ImportError:
 
 # Imports de la integración DHL
 try:
-    from Dhl_integration.get_rates import DHLRatesAPI
+    from carriers_apis_conections.get_rates_dhl import DHLRatesAPI
     DHL_AVAILABLE = True
 except ImportError:
     DHL_AVAILABLE = False
@@ -149,7 +149,7 @@ class DHLFreightService:
             "accounts": [
                 {
                     "typeCode": "shipper",
-                    "number": "741615792"  # Exacto como en Rating.txt
+                    "number": self.account_number  # Número de cuenta desde configuración
                 }
             ],
             "productCode": "P",

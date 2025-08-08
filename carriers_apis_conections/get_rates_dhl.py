@@ -42,9 +42,10 @@ class DHLRatesAPI:
             self.password = password or credentials["password"]
             self.test_mode = test_mode if test_mode is not None else DHL_DEFAULTS["test_mode"]
         else:
-            # Fallback a credenciales hardcodeadas si no hay configuración
-            self.username = username or "sunasolutioAR"
-            self.password = password or "M!3vN!1zX$7hD#7y"
+            # Fallback a variables de entorno si no hay configuración
+            import os
+            self.username = username or os.getenv("DHL_USERNAME", "")
+            self.password = password or os.getenv("DHL_PASSWORD", "")
             self.test_mode = test_mode if test_mode is not None else True
         
         # URLs de la API usando configuración centralizada
@@ -76,6 +77,15 @@ class DHLRatesAPI:
         auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
         # Agregar header de autorización
         self.headers["Authorization"] = f"Basic {auth_b64}"
+    
+    def _get_account_number(self):
+        """Obtener número de cuenta DHL desde configuración"""
+        if CONFIG_AVAILABLE:
+            credentials = get_dhl_credentials()
+            return credentials.get("account_number", "")
+        else:
+            import os
+            return os.getenv("DHL_ACCOUNT_NUMBER", "")
     
     def load_rating_template(self, filepath: str = "Rating.txt") -> Dict[str, Any]:
         """
@@ -173,7 +183,7 @@ class DHLRatesAPI:
                 "accounts": [
                     {
                         "typeCode": "shipper",
-                        "number": "741615792"
+                        "number": self._get_account_number()
                     }
                 ],
                 "productCode": "P",

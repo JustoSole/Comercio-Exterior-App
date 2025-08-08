@@ -7,12 +7,24 @@ Configuración centralizada para evitar duplicación de credenciales
 y parámetros de DHL en múltiples archivos.
 """
 
-# Credenciales DHL (centralizadas)
-DHL_CREDENTIALS = {
-    "username": "sunasolutioAR",
-    "password": "M!3vN!1zX$7hD#7y",
-    "account_number": "741615792"
-}
+# Credenciales DHL - Ahora se cargan desde secrets.toml
+def get_dhl_credentials_from_secrets():
+    """Cargar credenciales DHL desde secrets.toml de Streamlit"""
+    try:
+        import streamlit as st
+        return {
+            "username": st.secrets["api_keys"]["DHL_USERNAME"],
+            "password": st.secrets["api_keys"]["DHL_PASSWORD"],
+            "account_number": st.secrets["api_keys"]["DHL_ACCOUNT_NUMBER"]
+        }
+    except Exception:
+        # Fallback para scripts que no usan Streamlit
+        import os
+        return {
+            "username": os.getenv("DHL_USERNAME", ""),
+            "password": os.getenv("DHL_PASSWORD", ""),
+            "account_number": os.getenv("DHL_ACCOUNT_NUMBER", "")
+        }
 
 # URLs de API
 DHL_URLS = {
@@ -49,8 +61,8 @@ DEFAULT_ADDRESSES = {
 }
 
 def get_dhl_credentials():
-    """Obtener credenciales DHL"""
-    return DHL_CREDENTIALS.copy()
+    """Obtener credenciales DHL desde secrets.toml"""
+    return get_dhl_credentials_from_secrets()
 
 def get_dhl_url(test_mode=True):
     """Obtener URL de API según el modo"""
