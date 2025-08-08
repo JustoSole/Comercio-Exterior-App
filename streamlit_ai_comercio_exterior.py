@@ -2822,6 +2822,14 @@ def render_freight_options_section(result):
     best_quote = result.get('best_freight_quote', {})
     shipping_details = result.get('shipping_details', {})
     
+    # Validar que best_quote sea un diccionario
+    if not isinstance(best_quote, dict):
+        best_quote = {}
+    
+    # Validar que all_quotes sea una lista
+    if not isinstance(all_quotes, list):
+        all_quotes = []
+    
     if not all_quotes:
         # Si no hay opciones múltiples, mostrar solo información básica
         st.markdown("#### 🚚 Información de Flete")
@@ -2834,6 +2842,10 @@ def render_freight_options_section(result):
     # Crear DataFrame con todas las opciones
     freight_data = []
     for i, quote in enumerate(all_quotes):
+        # Validar que quote sea un diccionario
+        if not isinstance(quote, dict):
+            continue
+            
         # Determinar si es la opción seleccionada
         is_selected = (
             quote.get('carrier', '') == best_quote.get('carrier', '') and
@@ -2880,6 +2892,11 @@ def _render_selected_freight_details(best_quote, shipping_details):
     Función auxiliar para mostrar detalles de la opción de flete seleccionada.
     Mantiene el código modular y reutilizable.
     """
+    # Validar que best_quote sea un diccionario
+    if not isinstance(best_quote, dict):
+        st.warning("⚠️ Información de flete seleccionado no disponible")
+        return
+    
     st.markdown("##### 🏆 Detalles de la Opción Seleccionada")
     
     # Métricas de la opción seleccionada
