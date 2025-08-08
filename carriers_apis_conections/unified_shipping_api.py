@@ -37,8 +37,8 @@ except ImportError as e:
     FEDEX_AVAILABLE = False
 
 try:
-    from carriers_apis_conections.get_rates_dhl import DHLRatesAPI
-    from dhl_config import get_dhl_credentials, DHL_DEFAULTS
+    from .get_rates_dhl import DHLRatesAPI
+    from .dhl_config import get_dhl_credentials, DHL_DEFAULTS
     DHL_AVAILABLE = True
 except ImportError as e:
     print(f"⚠️ DHL no disponible: {e}")

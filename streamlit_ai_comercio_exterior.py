@@ -90,7 +90,7 @@ try:
     # NCM classification handled by ai_ncm_deep_classifier only
     from import_tax_calculator import calcular_impuestos_importacion
     from product_dimension_estimator import ProductShippingEstimator
-    from dhl_freight_integration import DHLFreightService
+    from carriers_apis_conections.dhl_integration import DHLFreightService
     # Mantener freight_estimation como fallback
     from freight_estimation import load_freight_rates, calculate_air_freight, calculate_sea_freight
     MODULES_AVAILABLE = True

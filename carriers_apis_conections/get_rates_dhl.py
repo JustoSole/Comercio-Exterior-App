@@ -13,11 +13,8 @@ import os
 import sys
 from typing import Dict, Any, Optional
 
-# Agregar el directorio padre al path para importar dhl_config
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
 try:
-    from dhl_config import get_dhl_credentials, get_dhl_url, get_default_addresses, DHL_DEFAULTS
+    from .dhl_config import get_dhl_credentials, get_dhl_url, get_default_addresses, DHL_DEFAULTS
     CONFIG_AVAILABLE = True
 except ImportError:
     CONFIG_AVAILABLE = False

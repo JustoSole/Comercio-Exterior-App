@@ -16,19 +16,16 @@ import sys
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
 
-# Agregar directorio padre para imports
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Imports de configuración DHL
+# Imports de configuración DHL (ahora en el mismo directorio)
 try:
-    from dhl_config import get_dhl_credentials, get_dhl_url, get_default_addresses, DHL_DEFAULTS
+    from .dhl_config import get_dhl_credentials, get_dhl_url, get_default_addresses, DHL_DEFAULTS
     DHL_CONFIG_AVAILABLE = True
 except ImportError:
     DHL_CONFIG_AVAILABLE = False
 
 # Imports de la integración DHL
 try:
-    from carriers_apis_conections.get_rates_dhl import DHLRatesAPI
+    from .get_rates_dhl import DHLRatesAPI
     DHL_AVAILABLE = True
 except ImportError:
     DHL_AVAILABLE = False
