@@ -90,9 +90,8 @@ try:
     # NCM classification handled by ai_ncm_deep_classifier only
     from import_tax_calculator import calcular_impuestos_importacion
     from product_dimension_estimator import ProductShippingEstimator
-    from carriers_apis_conections.dhl_integration import DHLFreightService
-    # Mantener freight_estimation como fallback
-    from freight_estimation import load_freight_rates, calculate_air_freight, calculate_sea_freight
+    # Usar el nuevo sistema de fletes sin dependencias de carriers APIs
+    from freight_estimation import load_freight_rates, calculate_air_freight, calculate_air_freight_by_origin, calculate_sea_freight
     MODULES_AVAILABLE = True
 except ImportError as e:
     st.error(f"Error importing modules: {e}")
@@ -444,14 +443,7 @@ def initialize_session_state():
         st.session_state.current_step = None
     if 'freight_rates' not in st.session_state:
         st.session_state.freight_rates = load_freight_rates(CONFIG['FREIGHT_RATES_FILE'])
-    if 'dhl_service' not in st.session_state:
-        # Crear servicio DHL con callback de debug
-        st.session_state.dhl_service = DHLFreightService(
-            test_mode=True,  # Por defecto usar test mode
-            use_dhl_real=True,  # Por defecto intentar usar DHL real
-                            fallback_rates_file=CONFIG['FREIGHT_RATES_FILE'],
-            debug_callback=debug_log  # Conectar el debug
-        )
+    # Sistema de fletes simplificado - ya no necesitamos DHL service
     if 'entry_mode' not in st.session_state:
         st.session_state.entry_mode = "Análisis desde URL"
     if 'product_data_editable' not in st.session_state:
@@ -1738,11 +1730,11 @@ def fetch_and_populate_from_url(url):
     # Poblar dimensiones y peso desde la estimación - SIEMPRE usar estimaciones IA
     dims = shipping_info.get('dimensions_cm', {})
     pde['dimensions_cm'] = {
-        "length": dims.get('length_cm', 0.0),
-        "width": dims.get('width_cm', 0.0),
-        "height": dims.get('height_cm', 0.0)
+        "length": float(dims.get('length_cm', 0.0)),
+        "width": float(dims.get('width_cm', 0.0)),
+        "height": float(dims.get('height_cm', 0.0))
     }
-    pde['weight_kg'] = shipping_info.get('weight_kg', 0.0)
+    pde['weight_kg'] = float(shipping_info.get('weight_kg', 0.0))
     pde['import_quantity'] = int(product.moq or 1)
     
     # Asegurar que el packaging_type esté establecido
@@ -1759,37 +1751,17 @@ def render_sidebar_config():
         st.markdown("### ⚙️ Configuración del Cálculo")
         st.session_state.debug_mode = st.checkbox("🔧 Debug", value=CONFIG['DEBUG_MODE'])
         
-        # DHL configuración automática (sin UI)
-        use_real_dhl = True  # Siempre usar DHL real
-        dhl_test_mode = True  # Mantener en modo test por defecto
-        
-        # Configurar servicio DHL solo si cambió
-        if (_needs_dhl_update(use_real_dhl, dhl_test_mode)):
-            _update_dhl_service(use_real_dhl, dhl_test_mode)
+        # Sistema de fletes simplificado - ya no necesitamos configuración DHL
         
         return {
             "tipo_importador": st.selectbox("Importador:", ["responsable_inscripto", "no_inscripto", "monotributista"], key="tipo_importador_sb"),
             "destino_importacion": st.selectbox("Destino:", ["reventa", "uso_propio", "bien_capital"], key="destino_sb"),
             "provincia": st.selectbox("Provincia:", ["CABA", "BUENOS_AIRES", "CORDOBA", "SANTA_FE"], key="provincia_sb"),
-            "tipo_flete": st.selectbox("Tipo de Flete:", ["Courier (Aéreo)", "Marítimo (Contenedor)"], key="tipo_flete_sb"),
+            "tipo_flete": st.selectbox("Tipo de Flete:", ["Aéreo desde China (27 USD/kg)", "Aéreo desde USA (13.5 USD/kg)", "Marítimo (Contenedor)"], key="tipo_flete_sb"),
             "cotizacion_dolar": st.number_input("Cotización USD/ARS", value=1746.96, format="%.2f", key="cotizacion_sb")
         }
 
-def _needs_dhl_update(use_real_dhl, dhl_test_mode):
-    """Verifica si necesita actualizar la configuración DHL"""
-    return ('dhl_use_real' not in st.session_state or 
-            st.session_state.dhl_use_real != use_real_dhl or
-            getattr(st.session_state.dhl_service, 'test_mode', None) != dhl_test_mode)
-
-def _update_dhl_service(use_real_dhl, dhl_test_mode):
-    """Actualiza el servicio DHL solo cuando es necesario"""
-    st.session_state.dhl_use_real = use_real_dhl
-    st.session_state.dhl_service = DHLFreightService(
-        test_mode=dhl_test_mode,
-        use_dhl_real=use_real_dhl,
-        fallback_rates_file=CONFIG['FREIGHT_RATES_FILE'],
-        debug_callback=debug_log
-    )
+# Funciones DHL eliminadas - sistema de fletes simplificado
 
 def render_main_calculator():
     """Renderizar la calculadora principal optimizada"""
@@ -2403,238 +2375,135 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
         costo_flete_total_usd = 0
         metodo_calculo = "Sin datos"
         
-        if tipo_flete == "Courier (Aéreo)":
-            # NUEVO: Usar API unificada que compara FedEx + DHL y elige la mejor opción
+        if "Aéreo desde China" in tipo_flete:
+            # Usar nuevo sistema de fletes - China a Argentina
             try:
-                from carriers_apis_conections.unified_shipping_api import get_cheapest_shipping_rate
+                costo_flete_total_usd = calculate_air_freight_by_origin(peso_facturable_kg, 'CN')
+                metodo_calculo = "Tarifa fija China-Argentina: 27 USD/kg"
                 
-                # Construir dimensiones
-                dimensions_cm_dict = {
-                    "length": dims.get('length', 25),
-                    "width": dims.get('width', 35), 
-                    "height": dims.get('height', 15)
+                flete_result = {
+                                "success": True,
+                    "cost_usd": costo_flete_total_usd,
+                    "method": "fixed_rate_china",
+                    "rate_per_kg": 27.0,
+                    "weight_kg": peso_facturable_kg,
+                    "origin": "China",
+                    "dhl_taxes_included": False
                 }
                 
-                # Obtener mejor cotización comparando FedEx y DHL usando direcciones del session state
-                unified_result = get_cheapest_shipping_rate(
-                    weight_kg=peso_facturable_kg,
-                    origin_country=origin_details.get('countryCode', 'CN'),  # Usar país de origen real (China)
-                    origin_postal=origin_details.get('postalCode', '518000'),  # Usar código postal real
-                    dest_country=destination_details.get('countryCode', 'AR'),
-                    dest_postal=destination_details.get('postalCode', 'C1000'),
-                    test_mode=True,
-                    debug=False
-                )
+                log_flow_step("CALCULO_FLETE_CHINA", "SUCCESS", {
+                    "peso_facturable_kg": peso_facturable_kg,
+                    "tarifa_por_kg": 27.0,
+                    "costo_total_usd": costo_flete_total_usd
+                })
                 
-                if unified_result["success"]:
-                    best_quote = unified_result["best_quote"]
-                    all_quotes = unified_result["all_quotes"]
-                    
-                    costo_flete_total_usd = best_quote.cost_usd
-                    metodo_calculo = f"{best_quote.carrier} - {best_quote.service_name}"
-                    
-                    debug_log(f"✅ Mejor cotización: {best_quote.carrier} ${best_quote.cost_usd:.2f} USD", level="SUCCESS")
-                    
-                    # Mostrar resultado principal con información detallada
-                    st.success(f"🏆 **Mejor opción seleccionada: {best_quote.carrier}** - ${best_quote.cost_usd:.2f} USD")
-                    
-                    # Información detallada del envío seleccionado
-                    col_best1, col_best2, col_best3 = st.columns(3)
-                    with col_best1:
-                        st.metric("📦 Servicio", best_quote.service_name)
-                    with col_best2:
-                        st.metric("⏰ Tiempo de tránsito", f"{best_quote.transit_days or 'N/A'} días")
-                    with col_best3:
-                        st.metric("💰 Costo total", f"${best_quote.cost_usd:.2f} USD")
-                    
-                    # Información detallada de direcciones y APIs
-                    col_route1, col_route2 = st.columns(2)
-                    with col_route1:
-                        st.info(f"📍 **Origen**: {origin_details.get('countryCode', 'CN')} - {origin_details.get('cityName', 'SHENZHEN')} ({origin_details.get('postalCode', '518000')})")
-                    with col_route2:
-                        st.info(f"🎯 **Destino**: {destination_details.get('countryCode', 'AR')} - {destination_details.get('cityName', 'CAPITAL FEDERAL')} ({destination_details.get('postalCode', 'C1000')})")
-                    
-                    # Información técnica de la consulta
-                    with st.expander("🔧 **Detalles técnicos de la consulta**", expanded=False):
-                        st.write("**Parámetros enviados a las APIs:**")
-                        col_tech1, col_tech2 = st.columns(2)
-                        with col_tech1:
-                            st.code(f"""FedEx API:
-origin_country: {origin_details.get('countryCode', 'CN')}
-origin_postal: {origin_details.get('postalCode', '518000')}
-dest_country: {destination_details.get('countryCode', 'AR')}
-dest_postal: {destination_details.get('postalCode', 'C1000')}
-weight: {peso_facturable_kg:.2f} kg""")
-                        with col_tech2:
-                            # Mostrar códigos postales normalizados para DHL
-                            from carriers_apis_conections.unified_shipping_api import UnifiedShippingAPI
-                            api_temp = UnifiedShippingAPI()
-                            dest_postal_norm = api_temp._normalize_postal_code(destination_details.get('postalCode', 'C1000'), destination_details.get('countryCode', 'AR'))
-                            origin_postal_norm = api_temp._normalize_postal_code(origin_details.get('postalCode', '518000'), origin_details.get('countryCode', 'CN'))
-                            st.code(f"""DHL API (normalizado):
-origin_country: {origin_details.get('countryCode', 'CN')}
-origin_postal: {origin_postal_norm}
-dest_country: {destination_details.get('countryCode', 'AR')}
-dest_postal: {dest_postal_norm}
-weight: {peso_facturable_kg:.2f} kg""")
-                    
-                    # Mostrar comparación de todas las opciones
-                    with st.expander("📊 **Ver todas las opciones disponibles y comparar carriers**", expanded=False):
-                        col1, col2 = st.columns(2)
-                        
-                        # Mostrar FedEx options
-                        with col1:
-                            st.markdown("### 🚀 **FedEx**")
-                            fedex_quotes = all_quotes.get("FedEx", [])
-                            if fedex_quotes:
-                                for i, quote in enumerate(fedex_quotes[:5], 1):  # Top 5
-                                    if quote.success:
-                                        is_selected = quote.carrier == best_quote.carrier and abs(quote.cost_usd - best_quote.cost_usd) < 0.01
-                                        icon = "🏆" if is_selected else "📦"
-                                        style = "background-color: #e8f5e8; padding: 10px; border-radius: 5px; margin: 5px 0;" if is_selected else ""
-                                        
-                                        rate_type_text = f" ({quote.rate_type})" if hasattr(quote, 'rate_type') and quote.rate_type != "Unknown" else ""
-                                        
-                                        st.markdown(f"""
-                                        <div style="{style}">
-                                            {icon} <strong>${quote.cost_usd:.2f} USD</strong> - {quote.service_name}{rate_type_text}<br>
-                                            <small>⏰ {quote.transit_days or 'N/A'} días de tránsito</small>
-                                        </div>
-                                        """, unsafe_allow_html=True)
-                                    else:
-                                        st.write(f"❌ Error: {quote.error_message}")
-                            else:
-                                st.write("❌ No disponible")
-                        
-                        # Mostrar DHL options  
-                        with col2:
-                            st.markdown("### 📦 **DHL**")
-                            dhl_quotes = all_quotes.get("DHL", [])
-                            if dhl_quotes:
-                                for i, quote in enumerate(dhl_quotes, 1):
-                                    if quote.success:
-                                        is_selected = quote.carrier == best_quote.carrier and abs(quote.cost_usd - best_quote.cost_usd) < 0.01
-                                        icon = "🏆" if is_selected else "📦"
-                                        style = "background-color: #e8f5e8; padding: 10px; border-radius: 5px; margin: 5px 0;" if is_selected else ""
-                                        
-                                        rate_type_text = f" ({quote.rate_type})" if hasattr(quote, 'rate_type') and quote.rate_type != "Unknown" else ""
-                                        
-                                        st.markdown(f"""
-                                        <div style="{style}">
-                                            {icon} <strong>${quote.cost_usd:.2f} USD</strong> - {quote.service_name}{rate_type_text}<br>
-                                            <small>⏰ {quote.transit_days or 'N/A'} días de tránsito</small>
-                                        </div>
-                                        """, unsafe_allow_html=True)
-                                    else:
-                                        st.write(f"❌ Error: {quote.error_message}")
-                            else:
-                                st.write("❌ No disponible")
-                    
-                    # Log todas las respuestas para debug
-                    log_api_call("UNIFIED_SHIPPING", {"weight": peso_facturable_kg}, unified_result, True)
-                    
-                    # Variables para compatibilidad con código existente
-                    insurance_cost = 0.0
-                    argentina_taxes = 0.0
-                    
-                else:
-                    # Fallback: usar solo DHL si la API unificada falla
-                    debug_log(f"⚠️ API unificada falló, usando DHL como fallback: {unified_result.get('error')}", level="WARNING")
-                    st.warning("⚠️ Comparación de carriers no disponible, usando DHL...")
-                    
-                    # Usar direcciones reales del session state también en fallback DHL
-                    fallback_origin = origin_details or {
-                        "postalCode": "518000",
-                        "cityName": "SHENZHEN",
-                        "countryCode": "CN",
-                        "addressLine1": "address1",
-                        "addressLine2": "address2",
-                        "addressLine3": "address3"
-                    }
-                    fallback_destination = destination_details or {
-                        "postalCode": "C1000",
-                        "cityName": "BUENOS AIRES",
-                        "countryCode": "AR",
-                        "addressLine1": "address1",
-                        "addressLine2": "address2",
-                        "addressLine3": "address3"
-                    }
-                    
-                    # Usar servicio DHL original como fallback
-                    dhl_result = st.session_state.dhl_service.calculate_freight_with_fallback(
-                        weight_kg=peso_facturable_kg,
-                        dimensions_cm=dimensions_cm_dict,
-                        origin_details=fallback_origin,
-                        destination_details=fallback_destination,
-                        shipping_datetime=st.session_state.get('planned_shipping_datetime')
-                    )
-                    
-                    costo_flete_total_usd = dhl_result["cost_usd"]
-                    metodo_calculo = f"DHL {dhl_result['method']} (fallback)"
-                    
-                    # Extraer costos detallados si están disponibles
-                    insurance_cost = 0.0
-                    argentina_taxes = 0.0
-                    
-                    if 'cost_breakdown' in dhl_result:
-                        cost_breakdown = dhl_result['cost_breakdown']
-                        insurance_cost = cost_breakdown.get('insurance_cost', 0.0)
-                        argentina_taxes = cost_breakdown.get('argentina_taxes', 0.0)
-                    
-                    if dhl_result["success"]:
-                        st.info(f"📦 DHL: ${costo_flete_total_usd:.2f} USD")
-                    else:
-                        st.error(f"❌ Error en cotización: {dhl_result.get('error')}")
-                        costo_flete_total_usd = peso_facturable_kg * 45  # Estimación básica
-                        metodo_calculo = "Estimación básica"
-                        st.warning(f"📈 Usando estimación: ${costo_flete_total_usd:.2f} USD")
-                    
-                # Almacenar información completa del resultado para uso posterior
-                result_session_data = {
-                    'dhl_insurance_cost': insurance_cost,
-                    'dhl_argentina_taxes': argentina_taxes,
-                    'dhl_insurance_included': False,  # API unificada no tiene esta info
-                    'dhl_taxes_included': False,  # API unificada no tiene esta info
-                    'cost_breakdown': {},  # API unificada maneja esto diferente
-                    'test_mode': True,
-                    'service': metodo_calculo,
-                    'transit_days': best_quote.transit_days if unified_result["success"] else 2,
-                    # Agregar opciones de flete para mostrar en la UI
-                    'all_freight_quotes': all_quotes if unified_result["success"] else [],
-                    'best_freight_quote': best_quote._asdict() if unified_result["success"] and hasattr(best_quote, '_asdict') else best_quote if unified_result["success"] else {}
-                }
-                    
             except Exception as e:
-                # Fallback final a cálculo tradicional
-                debug_log(f"❌ Error en servicio DHL integrado: {e}. Usando fallback tradicional.", level="ERROR")
-                if st.session_state.freight_rates is not None:
-                    costo_flete_total_usd = calculate_air_freight(peso_facturable_kg, st.session_state.freight_rates)
-                    metodo_calculo = "Fallback tradicional DHL Zona 5"
-                    st.warning(f"⚠️ Usando tarifas tradicionales: ${costo_flete_total_usd:.2f} USD")
-                else:
-                    costo_flete_total_usd = 0
-                    metodo_calculo = "Sin tarifas disponibles"
-                    st.error("❌ No se pudo calcular flete aéreo")
+                st.error(f"Error en cálculo de flete desde China: {e}")
+                costo_flete_total_usd = peso_facturable_kg * 27.0  # Fallback manual
+                metodo_calculo = "Fallback manual China: 27 USD/kg"
+                flete_result = {
+                    "success": False,
+                    "cost_usd": costo_flete_total_usd,
+                    "method": "fallback_china",
+                    "error": str(e),
+                    "dhl_taxes_included": False
+                }
+
+        elif "Aéreo desde USA" in tipo_flete:
+            # Usar nuevo sistema de fletes - USA a Argentina
+            try:
+                costo_flete_total_usd = calculate_air_freight_by_origin(peso_facturable_kg, 'US')
+                metodo_calculo = "Tarifa fija USA-Argentina: 13.5 USD/kg"
                 
-                # Sin información adicional en fallback
+                flete_result = {
+                    "success": True,
+                    "cost_usd": costo_flete_total_usd,
+                    "method": "fixed_rate_usa",
+                    "rate_per_kg": 13.5,
+                    "weight_kg": peso_facturable_kg,
+                    "origin": "USA",
+                    "dhl_taxes_included": False
+                }
+                
+                log_flow_step("CALCULO_FLETE_USA", "SUCCESS", {
+                    "peso_facturable_kg": peso_facturable_kg,
+                    "tarifa_por_kg": 13.5,
+                    "costo_total_usd": costo_flete_total_usd
+                })
+                
+            except Exception as e:
+                st.error(f"Error en cálculo de flete desde USA: {e}")
+                costo_flete_total_usd = peso_facturable_kg * 13.5  # Fallback manual
+                metodo_calculo = "Fallback manual USA: 13.5 USD/kg"
+                flete_result = {
+                    "success": False,
+                    "cost_usd": costo_flete_total_usd,
+                    "method": "fallback_usa", 
+                    "error": str(e),
+                    "dhl_taxes_included": False
+                }
+
+        elif "Marítimo (Contenedor)" in tipo_flete:
+            if volumen_total_cbm > 0:
+                # Usar exactamente 90 USD por m³
+                costo_flete_total_usd = calculate_sea_freight(volumen_total_cbm)
+                metodo_calculo = "Tarifa fija marítima: 90 USD/m³"
+                
+                flete_result = {
+                                "success": True,
+                    "cost_usd": costo_flete_total_usd,
+                    "method": "fixed_rate_maritime",
+                    "rate_per_m3": 90.0,
+                    "volume_m3": volumen_total_cbm,
+                    "dhl_taxes_included": False
+                }
+                
+                debug_log(f"✅ Flete marítimo calculado: ${costo_flete_total_usd:.2f} para {volumen_total_cbm:.6f} m³ a 90 USD/m³", level="SUCCESS")
+                else:
+                # Sin dimensiones válidas, no calcular flete marítimo
+                costo_flete_total_usd = 0
+                metodo_calculo = "Sin dimensiones válidas"
+                
+                flete_result = {
+                    "success": False,
+                    "cost_usd": 0,
+                    "method": "no_dimensions",
+                    "error": "Sin dimensiones válidas",
+                    "dhl_taxes_included": False
+                }
+                
+                debug_log("❌ No se puede calcular flete marítimo sin dimensiones válidas", level="ERROR")
+        
+                    else:
+            # Tipo de flete no reconocido, usar China como default
+            costo_flete_total_usd = calculate_air_freight_by_origin(peso_facturable_kg, 'CN')
+            metodo_calculo = "Fallback: Tarifa fija China-Argentina: 27 USD/kg"
+            
+            flete_result = {
+                "success": True,
+                "cost_usd": costo_flete_total_usd,
+                "method": "fallback_china",
+                "rate_per_kg": 27.0,
+                "weight_kg": peso_facturable_kg,
+                "origin": "China",
+                "dhl_taxes_included": False
+            }
+            
+            debug_log(f"⚠️ Tipo de flete no reconocido: {tipo_flete}. Usando China como fallback.", level="WARNING")
+        
+        # Información de sesión para compatibilidad con código existente
                 result_session_data = {
                     'dhl_insurance_cost': 0.0,
                     'dhl_argentina_taxes': 0.0,
                     'dhl_insurance_included': False,
-                    'dhl_taxes_included': False
-                }
-
-        elif tipo_flete == "Marítimo (Contenedor)":
-            if volumen_total_cbm > 0:
-                # Usar exactamente 90 USD por m³
-                costo_flete_total_usd = volumen_total_cbm * 90.0
-                metodo_calculo = "90 USD/m³"
-                debug_log(f"✅ Flete marítimo calculado: ${costo_flete_total_usd:.2f} para {volumen_total_cbm:.6f} m³ a 90 USD/m³", level="SUCCESS")
-            else:
-                # Sin dimensiones válidas, no calcular flete marítimo
-                costo_flete_total_usd = 0
-                metodo_calculo = "Sin dimensiones válidas"
-                debug_log("❌ No se puede calcular flete marítimo sin dimensiones válidas", level="ERROR")
+            'dhl_taxes_included': False,
+            'cost_breakdown': {},
+            'test_mode': True,
+            'service': metodo_calculo,
+            'transit_days': 2,
+            'all_freight_quotes': [],
+            'best_freight_quote': {}
+        }
         
         # Calcular costo unitario CORRECTAMENTE
         costo_flete_unitario_usd = costo_flete_total_usd / import_quantity if import_quantity > 0 else 0
@@ -2691,10 +2560,10 @@ weight: {peso_facturable_kg:.2f} kg""")
                 "method": "Manual" if st.session_state.entry_mode == 'Ingreso Manual' else 'Edited',
                 "metodo_calculo_flete": metodo_calculo,
                 # NUEVO: Agregar desglose de costos DHL si está disponible
-                "dhl_cost_breakdown": result_session_data.get('cost_breakdown', {}) if 'result_session_data' in locals() and result_session_data else {},
-                "dhl_test_mode": result_session_data.get('test_mode', True) if 'result_session_data' in locals() and result_session_data else True,
-                "dhl_service_name": result_session_data.get('service', 'N/A') if 'result_session_data' in locals() and result_session_data else 'N/A',
-                "dhl_transit_days": result_session_data.get('transit_days', 2) if 'result_session_data' in locals() and result_session_data else 2
+                "dhl_cost_breakdown": {}.get('cost_breakdown', {}) if 'result_session_data' in locals() and result_session_data else {},
+                "dhl_test_mode": {}.get('test_mode', True) if 'result_session_data' in locals() and result_session_data else True,
+                "dhl_service_name": {}.get('service', 'N/A') if 'result_session_data' in locals() and result_session_data else 'N/A',
+                "dhl_transit_days": {}.get('transit_days', 2) if 'result_session_data' in locals() and result_session_data else 2
             },
             "landed_cost": landed_cost,
             "precio_base": precio_base,
@@ -2708,15 +2577,15 @@ weight: {peso_facturable_kg:.2f} kg""")
                 "import_quantity": import_quantity
             },
             # NUEVO: Información adicional de DHL
-            "dhl_details": result_session_data if 'result_session_data' in locals() else {
+            "dhl_details": {} if False else {
                 'dhl_insurance_cost': 0.0,
                 'dhl_argentina_taxes': 0.0,
                 'dhl_insurance_included': False,
                 'dhl_taxes_included': False
             },
             # NUEVO: Opciones de flete para mostrar en la UI
-            "all_freight_quotes": result_session_data.get('all_freight_quotes', []) if 'result_session_data' in locals() else [],
-            "best_freight_quote": result_session_data.get('best_freight_quote', {}) if 'result_session_data' in locals() else {}
+            "all_freight_quotes": {}.get('all_freight_quotes', []) if 'result_session_data' in locals() else [],
+            "best_freight_quote": {}.get('best_freight_quote', {}) if 'result_session_data' in locals() else {}
         }
         log_flow_step("FIN_ANALISIS", "SUCCESS", {"landed_cost": landed_cost})
         st.rerun()
@@ -2826,71 +2695,131 @@ def render_freight_options_section(result):
     if not isinstance(best_quote, dict):
         best_quote = {}
     
-    # Validar que all_quotes sea una lista
-    if not isinstance(all_quotes, list):
-        all_quotes = []
+    # Validar y procesar all_quotes que puede venir como lista o diccionario
+    processed_quotes = []
+    if isinstance(all_quotes, dict):
+        # Si all_quotes es un diccionario de carriers (formato: {carrier: [quotes]})
+        for carrier, quotes in all_quotes.items():
+            if isinstance(quotes, list):
+                for quote in quotes:
+                    if isinstance(quote, dict):
+                        quote_dict = quote.copy()
+                        quote_dict['carrier'] = quote_dict.get('carrier', carrier)
+                        processed_quotes.append(quote_dict)
+                    elif hasattr(quote, '_asdict'):
+                        quote_dict = quote._asdict()
+                        quote_dict['carrier'] = quote_dict.get('carrier', carrier)
+                        processed_quotes.append(quote_dict)
+                    else:
+                        try:
+                            from dataclasses import is_dataclass, asdict
+                            if is_dataclass(quote):
+                                quote_dict = asdict(quote)
+                                quote_dict['carrier'] = quote_dict.get('carrier', carrier)
+                                processed_quotes.append(quote_dict)
+                            else:
+                                # Fallback: construir dict básico desde atributos
+                                quote_dict = {
+                                    'carrier': getattr(quote, 'carrier', carrier),
+                                    'service_name': getattr(quote, 'service_name', 'N/A'),
+                                    'cost_usd': getattr(quote, 'cost_usd', 0),
+                                    'transit_days': getattr(quote, 'transit_days', None),
+                                    'success': getattr(quote, 'success', False),
+                                    'rate_type': getattr(quote, 'rate_type', 'UNKNOWN'),
+                                }
+                                processed_quotes.append(quote_dict)
+                        except Exception:
+                            # Último recurso: ignorar entrada inválida
+                            pass
+    elif isinstance(all_quotes, list):
+        # Si all_quotes ya es una lista
+        for quote in all_quotes:
+            if isinstance(quote, dict):
+                processed_quotes.append(quote)
+            elif hasattr(quote, '_asdict'):
+                processed_quotes.append(quote._asdict())
+            else:
+                try:
+                    from dataclasses import is_dataclass, asdict
+                    if is_dataclass(quote):
+                        processed_quotes.append(asdict(quote))
+                    else:
+                        processed_quotes.append({
+                            'carrier': getattr(quote, 'carrier', 'N/A'),
+                            'service_name': getattr(quote, 'service_name', 'N/A'),
+                            'cost_usd': getattr(quote, 'cost_usd', 0),
+                            'transit_days': getattr(quote, 'transit_days', None),
+                            'success': getattr(quote, 'success', False),
+                            'rate_type': getattr(quote, 'rate_type', 'UNKNOWN'),
+                        })
+                except Exception:
+                    pass
     
-    if not all_quotes:
+    if not processed_quotes:
         # Si no hay opciones múltiples, mostrar solo información básica
         st.markdown("#### 🚚 Información de Flete")
         metodo_flete = shipping_details.get('metodo_calculo_flete', 'Método no especificado')
         st.info(f"**Método de cálculo**: {metodo_flete}")
+        # Mostrar detalles del único flete disponible si existe best_quote
+        if best_quote:
+            _render_selected_freight_details(best_quote, shipping_details, result)
         return
     
     st.markdown("#### 🚚 Opciones de Flete Disponibles")
     
     # Crear DataFrame con todas las opciones
     freight_data = []
-    for i, quote in enumerate(all_quotes):
-        # Validar que quote sea un diccionario
-        if not isinstance(quote, dict):
-            continue
-            
+    for i, quote in enumerate(processed_quotes):
         # Determinar si es la opción seleccionada
         is_selected = (
             quote.get('carrier', '') == best_quote.get('carrier', '') and
-            quote.get('cost_usd', 0) == best_quote.get('cost_usd', 0)
+            abs(quote.get('cost_usd', 0) - best_quote.get('cost_usd', 0)) < 0.01
         )
+        
+        # Estado de la cotización con más detalle
+        status = "🟢 Exitoso" if quote.get('success', False) else "🔴 Error"
+        if quote.get('error_message'):
+            status = f"🔴 {quote.get('error_message')[:30]}..."
         
         freight_data.append({
             "Seleccionado": "✅" if is_selected else "⚪",
-            "Carrier": quote.get('carrier', 'N/A'),
+            "Transportista": quote.get('carrier', 'N/A'),
             "Servicio": quote.get('service_name', 'N/A'),
             "Costo USD": f"${quote.get('cost_usd', 0):.2f}",
-            "Tiempo de Tránsito": f"{quote.get('transit_days', 'N/A')} días" if quote.get('transit_days') else 'N/A',
-            "Método": quote.get('method', 'N/A'),
-            "Estado": "🟢 Exitoso" if quote.get('success', False) else "🔴 Error"
+            "Tiempo": f"{quote.get('transit_days', 'N/A')} días" if quote.get('transit_days') else 'N/A',
+            "Estado": status,
+            "Tipo": quote.get('rate_type', quote.get('method', 'N/A'))
         })
     
     if freight_data:
         df_freight = pd.DataFrame(freight_data)
         
-        # Mostrar tabla con estilo
+        # Mostrar tabla con estilo mejorado
         st.dataframe(
             df_freight,
             use_container_width=True,
             hide_index=True,
             column_config={
                 "Seleccionado": st.column_config.TextColumn("", width="small"),
-                "Carrier": st.column_config.TextColumn("Transportista", width="medium"),
-                "Servicio": st.column_config.TextColumn("Servicio", width="medium"),
+                "Transportista": st.column_config.TextColumn("Transportista", width="medium"),
+                "Servicio": st.column_config.TextColumn("Servicio", width="large"),
                 "Costo USD": st.column_config.TextColumn("Costo", width="small"),
-                "Tiempo de Tránsito": st.column_config.TextColumn("Tiempo", width="small"),
-                "Método": st.column_config.TextColumn("Método", width="medium"),
-                "Estado": st.column_config.TextColumn("Estado", width="small")
+                "Tiempo": st.column_config.TextColumn("Tiempo", width="small"),
+                "Estado": st.column_config.TextColumn("Estado", width="medium"),
+                "Tipo": st.column_config.TextColumn("Tipo", width="medium")
             }
         )
         
         # Mostrar información adicional de la opción seleccionada
         if best_quote:
-            _render_selected_freight_details(best_quote, shipping_details)
+            _render_selected_freight_details(best_quote, shipping_details, result)
     else:
         st.warning("⚠️ No se encontraron opciones de flete disponibles")
 
-def _render_selected_freight_details(best_quote, shipping_details):
+def _render_selected_freight_details(best_quote, shipping_details, result=None):
     """
     Función auxiliar para mostrar detalles de la opción de flete seleccionada.
-    Mantiene el código modular y reutilizable.
+    Incluye desglose detallado de costos cuando está disponible.
     """
     # Validar que best_quote sea un diccionario
     if not isinstance(best_quote, dict):
@@ -2932,6 +2861,9 @@ def _render_selected_freight_details(best_quote, shipping_details):
             help="Tiempo estimado de tránsito"
         )
     
+    # DESGLOSE DETALLADO DE COSTOS
+    _render_cost_breakdown(best_quote, shipping_details, result)
+    
     # Información adicional si está disponible
     raw_response = best_quote.get('raw_response', {})
     if raw_response:
@@ -2946,6 +2878,198 @@ def _render_selected_freight_details(best_quote, shipping_details):
         st.warning("⚠️ **Cotización obtenida de tarifas de respaldo**")
     elif 'estimation' in method.lower():
         st.info("📊 **Cotización estimativa**")
+
+def _render_cost_breakdown(best_quote, shipping_details, result=None):
+    """
+    Renderiza el desglose detallado de costos del flete seleccionado.
+    Muestra todos los componentes del costo cuando están disponibles.
+    """
+    # Obtener información de desglose de diferentes fuentes
+    cost_breakdown = None
+    dhl_details = {}
+    
+    # Primero intentar obtener desde best_quote (más directo)
+    if 'cost_breakdown' in best_quote:
+        cost_breakdown = best_quote['cost_breakdown']
+    
+    # También obtener desde result si está disponible
+    if result:
+        dhl_details = result.get('dhl_details', {})
+        if not cost_breakdown and dhl_details.get('cost_breakdown'):
+            cost_breakdown = dhl_details['cost_breakdown']
+    
+    # Obtener desde raw_response si está disponible
+    raw_response = best_quote.get('raw_response', {})
+    if not cost_breakdown and raw_response:
+        # Intentar extraer desglose de la respuesta cruda de DHL
+        products = raw_response.get('products', [])
+        if products:
+            product = products[0]
+            detailed_breakdown = product.get('detailedPriceBreakdown', [])
+            if detailed_breakdown:
+                cost_breakdown = _extract_cost_breakdown_from_raw(detailed_breakdown)
+    
+    if not cost_breakdown:
+        # Si no hay desglose disponible, mostrar solo el costo total
+        total_cost = best_quote.get('cost_usd', 0)
+        if total_cost > 0:
+            st.markdown("##### 💰 Costo Total")
+            st.metric("Flete Total", f"${total_cost:.2f} USD", help="Costo total del envío sin desglose detallado")
+        return
+    
+    st.markdown("##### 💰 Desglose Detallado de Costos")
+    
+    # Crear tabla de desglose
+    breakdown_data = []
+    total_shown = 0.0
+    
+    # Servicio base
+    base_cost = cost_breakdown.get('base_service_cost', 0.0)
+    if base_cost > 0:
+        service_name = cost_breakdown.get('service_name', 'Servicio de envío')
+        breakdown_data.append({
+            "Concepto": "🚀 Servicio Base",
+            "Descripción": service_name,
+            "Costo USD": f"${base_cost:.2f}"
+        })
+        total_shown += base_cost
+    
+    # Recargo de combustible
+    fuel_cost = cost_breakdown.get('fuel_surcharge', 0.0)
+    if fuel_cost > 0:
+        breakdown_data.append({
+            "Concepto": "⛽ Recargo Combustible",
+            "Descripción": "Ajuste por precio del combustible",
+            "Costo USD": f"${fuel_cost:.2f}"
+        })
+        total_shown += fuel_cost
+    
+    # Seguro
+    insurance_cost = cost_breakdown.get('insurance_cost', 0.0)
+    if insurance_cost > 0:
+        breakdown_data.append({
+            "Concepto": "🛡️ Seguro",
+            "Descripción": "Protección de la mercadería",
+            "Costo USD": f"${insurance_cost:.2f}"
+        })
+        total_shown += insurance_cost
+    
+    # Impuestos Argentina
+    argentina_taxes = cost_breakdown.get('argentina_taxes', 0.0)
+    if argentina_taxes > 0:
+        breakdown_data.append({
+            "Concepto": "🏛️ Impuestos Argentina",
+            "Descripción": "IVA, Ganancias y otros impuestos locales",
+            "Costo USD": f"${argentina_taxes:.2f}"
+        })
+        total_shown += argentina_taxes
+    
+    # Otros costos
+    other_costs = cost_breakdown.get('other_costs', 0.0)
+    if other_costs > 0:
+        breakdown_data.append({
+            "Concepto": "📋 Otros Costos",
+            "Descripción": "Tasas administrativas y otros servicios",
+            "Costo USD": f"${other_costs:.2f}"
+        })
+        total_shown += other_costs
+    
+    # GoGreen (mostrar como informativo, excluido del total)
+    gogreen_cost = cost_breakdown.get('gogreen_cost', 0.0)
+    if gogreen_cost > 0:
+        breakdown_data.append({
+            "Concepto": "🌿 GoGreen Plus (Excluido)",
+            "Descripción": "Compensación de carbono (no incluido en el total)",
+            "Costo USD": f"${gogreen_cost:.2f}"
+        })
+    
+    # Mostrar tabla si hay datos
+    if breakdown_data:
+        df_breakdown = pd.DataFrame(breakdown_data)
+        st.dataframe(
+            df_breakdown,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Concepto": st.column_config.TextColumn("Concepto", width="medium"),
+                "Descripción": st.column_config.TextColumn("Descripción", width="large"),
+                "Costo USD": st.column_config.TextColumn("Costo", width="small")
+            }
+        )
+        
+        # Mostrar total calculado vs total real
+        real_total = cost_breakdown.get('total_cost', best_quote.get('cost_usd', 0))
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("💵 Subtotal Mostrado", f"${total_shown:.2f} USD")
+        with col2:
+            st.metric("💰 Total Real", f"${real_total:.2f} USD")
+        
+        # Mostrar nota si hay diferencia
+        if abs(total_shown - real_total) > 0.01:
+            st.info(f"💡 **Nota**: La diferencia de ${abs(total_shown - real_total):.2f} USD puede incluir redondeos, descuentos aplicados o costos base no itemizados.")
+    
+    else:
+        # Fallback: mostrar solo el total
+        total_cost = cost_breakdown.get('total_cost', best_quote.get('cost_usd', 0))
+        st.metric("Costo Total", f"${total_cost:.2f} USD")
+
+def _extract_cost_breakdown_from_raw(detailed_breakdown):
+    """
+    Extrae el desglose de costos desde la respuesta cruda de DHL.
+    """
+    cost_breakdown = {
+        "base_service_cost": 0.0,
+        "fuel_surcharge": 0.0,
+        "insurance_cost": 0.0,
+        "argentina_taxes": 0.0,
+        "gogreen_cost": 0.0,
+        "other_costs": 0.0,
+        "total_cost": 0.0
+    }
+    
+    for currency_breakdown in detailed_breakdown:
+        if currency_breakdown.get('currencyType') == 'BILLC' and currency_breakdown.get('priceCurrency') == 'USD':
+            breakdown_items = currency_breakdown.get('breakdown', [])
+            
+            for item in breakdown_items:
+                item_name = item.get('name', '').upper()
+                item_cost = float(item.get('price', 0.0))
+                
+                # Categorizar costos
+                if 'EXPRESS WORLDWIDE' in item_name or 'SERVICE' in item_name:
+                    cost_breakdown["base_service_cost"] = item_cost
+                elif 'FUEL' in item_name:
+                    cost_breakdown["fuel_surcharge"] = item_cost
+                elif 'PROTECCION' in item_name or 'INSURANCE' in item_name or 'SEGURO' in item_name:
+                    cost_breakdown["insurance_cost"] = item_cost
+                elif 'GOGREEN' in item_name or 'CARBON' in item_name:
+                    cost_breakdown["gogreen_cost"] = item_cost
+                elif 'INGBRC' in item_name or 'ARGENTINA' in item_name or any(tax in item_name for tax in ['IVA', 'GANANCIAS', 'BRUTOS']):
+                    cost_breakdown["argentina_taxes"] += item_cost
+                else:
+                    cost_breakdown["other_costs"] += item_cost
+            break
+    
+    # Calcular total (excluyendo GoGreen)
+    cost_breakdown["total_cost"] = (
+        cost_breakdown["base_service_cost"] +
+        cost_breakdown["fuel_surcharge"] +
+        cost_breakdown["insurance_cost"] +
+        cost_breakdown["argentina_taxes"] +
+        cost_breakdown["other_costs"]
+    )
+    
+    return cost_breakdown
+
+# Función eliminada - ya no se usa con el nuevo sistema de fletes
+
+# Función de debug eliminada - ya no se usa con el nuevo sistema de fletes
+def _show_detailed_freight_debug_REMOVED():
+    """Función eliminada - ya no se usa con el nuevo sistema de fletes"""
+    pass
+
 
 def show_calculator_table():
     result = st.session_state.result
@@ -3454,7 +3578,7 @@ def render_complete_analysis_tab(result):
     cotizacion = result['configuracion'].get('cotizacion_dolar', 1000)
     
     # Etiqueta de flete mejorada
-    tipo_flete = result['configuracion'].get("tipo_flete", "Courier (Aéreo)")
+    tipo_flete = result['configuracion'].get("tipo_flete", "Aéreo desde China (27 USD/kg)")
     flete_label = f"🚚 Flete {tipo_flete}"
 
     # Calcular porcentajes asegurando que la suma sea exactamente 100.0%
@@ -3660,10 +3784,10 @@ def render_complete_analysis_tab(result):
             
             impuestos_total_tier = float(tax_result_tier.total_impuestos)
             # Usar el método de flete actual de la configuración para cálculo consistente
-            if result['configuracion'].get('tipo_flete') == "Courier (Aéreo)":
+            if "Aéreo desde" in result['configuracion'].get('tipo_flete', ''):
                 # Para tiers, usar estimación proporcional al precio
                 flete_costo_estimado_tier = price * 0.15 
-            elif result['configuracion'].get('tipo_flete') == "Marítimo (Contenedor)":
+            elif "Marítimo (Contenedor)" in result['configuracion'].get('tipo_flete', ''):
                 # Para marítimo, el costo es más por volumen, no tanto por precio
                 flete_costo_estimado_tier = price * 0.12
             else:
@@ -4068,102 +4192,33 @@ def recalculate_and_update_session(result, new_price, new_flete_type, selected_o
         flete_costo_total = 0.0
         metodo_calculo = "Sin datos"
         
-        if new_flete_type == "Courier (Aéreo)":
-            # NUEVO: Usar API unificada también en recálculo
+        if "Aéreo desde China" in new_flete_type:
+            # Usar nuevo sistema de fletes - China a Argentina (recálculo)
             try:
-                from carriers_apis_conections.unified_shipping_api import get_cheapest_shipping_rate
+                costo_flete_total_usd = calculate_air_freight_by_origin(peso_facturable_kg, 'CN')
+                metodo_calculo = "Tarifa fija China-Argentina: 27 USD/kg (recálculo)"
+                flete_costo_total = costo_flete_total_usd
                 
-                dimensions_cm_dict = {
-                    "length": dims.get('length', 25),
-                    "width": dims.get('width', 35), 
-                    "height": dims.get('height', 15)
-                }
-                
-                # Usar API unificada en recálculo también con direcciones reales
-                unified_result = get_cheapest_shipping_rate(
-                    weight_kg=peso_facturable_kg,
-                    origin_country=st.session_state.origin_details.get('countryCode', 'CN'),
-                    origin_postal=st.session_state.origin_details.get('postalCode', '518000'),
-                    dest_country=st.session_state.destination_details.get('countryCode', 'AR'),
-                    dest_postal=st.session_state.destination_details.get('postalCode', 'C1000'),
-                    test_mode=True,
-                    debug=False
-                )
-                
-                if unified_result["success"]:
-                    best_quote = unified_result["best_quote"]
-                    flete_costo_total = best_quote.cost_usd
-                    metodo_calculo = f"{best_quote.carrier} - {best_quote.service_name} (recalc)"
-                else:
-                    # Fallback a DHL solo si la API unificada falla
-                    # Definir direcciones por defecto para DHL
-                    origin_details = {
-                        "postalCode": "38125",
-                        "cityName": "MEMPHIS",
-                        "countryCode": "US",
-                        "addressLine1": "address1",
-                        "addressLine2": "address2",
-                        "addressLine3": "address3"
-                    }
-                    destination_details = {
-                        "postalCode": "C1000",
-                        "cityName": "BUENOS AIRES",
-                        "countryCode": "AR",
-                        "addressLine1": "address1",
-                        "addressLine2": "address2",
-                        "addressLine3": "address3"
-                    }
-                    
-                    dhl_result = st.session_state.dhl_service.calculate_freight_with_fallback(
-                        weight_kg=peso_facturable_kg,
-                        dimensions_cm=dimensions_cm_dict,
-                        origin_details=origin_details,
-                        destination_details=destination_details,
-                        shipping_datetime=st.session_state.get('planned_shipping_datetime')
-                    )
-                    flete_costo_total = dhl_result["cost_usd"]
-                    metodo_calculo = f"DHL {dhl_result['method']} (fallback recalc)"
-                
-                # Mantener variables para compatibilidad
-                insurance_cost = 0.0
-                argentina_taxes = 0.0
-                
-                # Usar flete_costo_total que ya se asignó arriba
-                costo_flete_total_usd = flete_costo_total
-                
-                # Almacenar información completa del resultado para uso posterior
-                result_session_data = {
-                    'dhl_insurance_cost': insurance_cost,
-                    'dhl_argentina_taxes': argentina_taxes,
-                    'dhl_insurance_included': False,  # API unificada no maneja estos detalles
-                    'dhl_taxes_included': False,  # API unificada no maneja estos detalles  
-                    'cost_breakdown': {},  # API unificada maneja esto diferente
-                    'test_mode': True,
-                    'service': metodo_calculo,
-                    'transit_days': 2  # Default para recálculo
-                }
+            except Exception as e:
+                st.error(f"Error en cálculo de flete desde China: {e}")
+                costo_flete_total_usd = peso_facturable_kg * 27.0  # Fallback manual
+                metodo_calculo = "Fallback manual China: 27 USD/kg (recálculo)"
+                flete_costo_total = costo_flete_total_usd
+
+        elif "Aéreo desde USA" in new_flete_type:
+            # Usar nuevo sistema de fletes - USA a Argentina (recálculo)
+            try:
+                costo_flete_total_usd = calculate_air_freight_by_origin(peso_facturable_kg, 'US')
+                metodo_calculo = "Tarifa fija USA-Argentina: 13.5 USD/kg (recálculo)"
+                flete_costo_total = costo_flete_total_usd
                     
             except Exception as e:
-                # Fallback final a cálculo tradicional
-                debug_log(f"❌ Error en servicio DHL integrado: {e}. Usando fallback tradicional.", level="ERROR")
-                if st.session_state.freight_rates is not None:
-                    costo_flete_total_usd = calculate_air_freight(peso_facturable_kg, st.session_state.freight_rates)
-                    metodo_calculo = "Fallback DHL Zona 5"
-                    st.warning(f"⚠️ Usando tarifas tradicionales: ${costo_flete_total_usd:.2f} USD")
-                else:
-                    costo_flete_total_usd = 0
-                    metodo_calculo = "Sin tarifas disponibles"
-                    st.error("❌ No se pudo calcular flete aéreo")
-                
-                # Sin información adicional en fallback
-                result_session_data = {
-                    'dhl_insurance_cost': 0.0,
-                    'dhl_argentina_taxes': 0.0,
-                    'dhl_insurance_included': False,
-                    'dhl_taxes_included': False
-                }
+                st.error(f"Error en cálculo de flete desde USA: {e}")
+                costo_flete_total_usd = peso_facturable_kg * 13.5  # Fallback manual
+                metodo_calculo = "Fallback manual USA: 13.5 USD/kg (recálculo)"
+                flete_costo_total = costo_flete_total_usd
 
-        elif new_flete_type == "Marítimo (Contenedor)":
+        elif "Marítimo (Contenedor)" in new_flete_type:
             if volumen_total_cbm > 0:
                 # Usar exactamente 90 USD por m³
                 costo_flete_total_usd = volumen_total_cbm * 90.0
@@ -4185,11 +4240,11 @@ def recalculate_and_update_session(result, new_price, new_flete_type, selected_o
             "volumen_unitario_cbm": volumen_unitario_cbm,
             "volumen_total_cbm": volumen_total_cbm,
             "metodo_calculo_flete": metodo_calculo,
-            # NUEVO: Agregar desglose de costos DHL en recálculo si está disponible
-            "dhl_cost_breakdown": result_session_data.get('cost_breakdown', {}) if 'result_session_data' in locals() and result_session_data else {},
-            "dhl_test_mode": result_session_data.get('test_mode', True) if 'result_session_data' in locals() and result_session_data else True,
-            "dhl_service_name": result_session_data.get('service', 'N/A') if 'result_session_data' in locals() and result_session_data else 'N/A',
-            "dhl_transit_days": result_session_data.get('transit_days', 2) if 'result_session_data' in locals() and result_session_data else 2
+            # Información simplificada para el nuevo sistema de fletes
+            "dhl_cost_breakdown": {},
+            "dhl_test_mode": True,
+            "dhl_service_name": metodo_calculo,
+            "dhl_transit_days": 2
         })
 
         # 3. Recalcular honorarios (dependen del precio)
@@ -4500,11 +4555,11 @@ def render_detailed_breakdown_tab(result):
     # Calcular flete total real considerando economías de escala
     peso_total_kg = result['shipping_details'].get('weight_kg', 1.0) * import_quantity
     dims = result['shipping_details'].get('dimensions_cm', {})
-    tipo_flete = result['configuracion'].get('tipo_flete', 'Courier (Aéreo)')
+    tipo_flete = result['configuracion'].get('tipo_flete', 'Aéreo desde China (27 USD/kg)')
     
-    if tipo_flete == "Courier (Aéreo)":
+    if "Aéreo desde" in tipo_flete:
         st.markdown(f"**Cálculo de Flete Aéreo:** Peso total = {peso_total_kg:.2f} kg")
-    elif tipo_flete == "Marítimo (Contenedor)" and all(d > 0 for d in dims.values()):
+    elif "Marítimo (Contenedor)" in tipo_flete and all(d > 0 for d in dims.values()):
         volumen_unitario = (dims['length'] * dims['width'] * dims['height']) / 1_000_000
         volumen_total = volumen_unitario * import_quantity
         st.markdown(f"**Cálculo de Flete Marítimo:** Volumen total = {volumen_total:.6f} m³")
@@ -4961,7 +5016,7 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
             # Preparar fórmulas críticas con batch_update
             formulas_requests = []
             
-            # TODAS las fórmulas necesarias (CORREGIDAS CON MAPEO EXACTO)
+            # TODAS las fórmulas necesarias (CORREGIDAS CON MAPEO EXACTO Y SEPARADOR ;)
             critical_formulas = [
                 (6, f"=E{num_rows}*F{num_rows}"),   # G: Subtotal FOB = Cantidad × Precio Unit
                 (11, f"=G{num_rows}*K{num_rows}"),  # L: Derechos USD = Subtotal × % Derechos
@@ -4974,15 +5029,15 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
                 (23, f"=G{num_rows}+W{num_rows}"),  # X: Subtotal + Impuestos
                 # FLETE Y COSTOS FINALES (COLUMNAS ACTUALIZADAS):
                 (34, f"=AH{num_rows}/E{num_rows}"),  # AI: Flete Unit = Flete Total ÷ Cantidad
-                (35, f"=G{num_rows}*0,02"),         # AJ: Honorarios = 2% del Subtotal FOB (formato argentino)
+                (35, f"=G{num_rows}*0;02"),         # AJ: Honorarios = 2% del Subtotal FOB (formato argentino)
                 (36, f"=G{num_rows}+W{num_rows}+AH{num_rows}+AJ{num_rows}"),  # AK: Landed Cost Total
                 # Precio y margen:
                 (40, f"=AM{num_rows}*AN{num_rows}"),  # AO: Comisión USD = PV × Comisión %
                 (41, f"=AM{num_rows}-AO{num_rows}"),  # AP: Ingreso Neto Unit = PV - Comisión
                 (42, f"=AP{num_rows}-AL{num_rows}"),  # AQ: Margen Unit = Neto - Landed Unit
-                (43, f"=IF(AM{num_rows}>0, AQ{num_rows}/AM{num_rows}, 0)"),  # AR: Margen % PV
-                (44, f"=IF(AL{num_rows}>0, AQ{num_rows}/AL{num_rows}, 0)"),  # AS: Markup % Costo
-                (45, f"=IF(1-AN{num_rows}>0, AL{num_rows}/(1-AN{num_rows}), 0)"),  # AT: Breakeven PV
+                (43, f"=IF(AM{num_rows}>0; AQ{num_rows}/AM{num_rows}; 0)"),  # AR: Margen % PV
+                (44, f"=IF(AL{num_rows}>0; AQ{num_rows}/AL{num_rows}; 0)"),  # AS: Markup % Costo
+                (45, f"=IF(1-AN{num_rows}>0; AL{num_rows}/(1-AN{num_rows}); 0)"),  # AT: Breakeven PV
             ]
             
             # Crear requests para batch_update
@@ -5018,7 +5073,7 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
             try:
                 st.info("🔄 Intentando método fallback con update_cell...")
                 
-                # Fórmulas críticas con números de columna 1-based para update_cell (CORREGIDAS)
+                # Fórmulas críticas con números de columna 1-based para update_cell (CORREGIDAS CON ;)
                 formulas_fallback = [
                     (7, f"=E{num_rows}*F{num_rows}"),   # G: Subtotal FOB = Cantidad × Precio Unit
                     (12, f"=G{num_rows}*K{num_rows}"),  # L: Derechos USD = Subtotal × % Derechos
@@ -5030,15 +5085,15 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
                     (23, f"=L{num_rows}+N{num_rows}+P{num_rows}+R{num_rows}+T{num_rows}+V{num_rows}"),  # W: Total Impuestos
                     (24, f"=G{num_rows}+W{num_rows}"),  # X: Subtotal + Impuestos
                     (35, f"=AH{num_rows}/E{num_rows}"), # AI: Flete Unit = Flete Total ÷ Cantidad (ACTUALIZADO)
-                    (36, f"=G{num_rows}*0,02"),         # AJ: Honorarios = 2% del Subtotal FOB (ACTUALIZADO)
+                    (36, f"=G{num_rows}*0;02"),         # AJ: Honorarios = 2% del Subtotal FOB (ACTUALIZADO)
                     (37, f"=G{num_rows}+W{num_rows}+AH{num_rows}+AJ{num_rows}"),  # AK: Landed Cost Total (ACTUALIZADO)
                     # Precio y margen (1-based): AO=41, AP=42, AQ=43, AR=44, AS=45, AT=46
                     (41, f"=AM{num_rows}*AN{num_rows}"),  # AO: Comisión USD
                     (42, f"=AM{num_rows}-AO{num_rows}"),  # AP: Ingreso Neto Unit
                     (43, f"=AP{num_rows}-AL{num_rows}"),  # AQ: Margen Unit
-                    (44, f"=IF(AM{num_rows}>0, AQ{num_rows}/AM{num_rows}, 0)"),  # AR: Margen % PV
-                    (45, f"=IF(AL{num_rows}>0, AQ{num_rows}/AL{num_rows}, 0)"),  # AS: Markup % Costo
-                    (46, f"=IF(1-AN{num_rows}>0, AL{num_rows}/(1-AN{num_rows}), 0)"),  # AT: Breakeven PV
+                    (44, f"=IF(AM{num_rows}>0; AQ{num_rows}/AM{num_rows}; 0)"),  # AR: Margen % PV
+                    (45, f"=IF(AL{num_rows}>0; AQ{num_rows}/AL{num_rows}; 0)"),  # AS: Markup % Costo
+                    (46, f"=IF(1-AN{num_rows}>0; AL{num_rows}/(1-AN{num_rows}); 0)"),  # AT: Breakeven PV
                 ]
                 
                 successful_formulas = 0
@@ -5154,14 +5209,14 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
             st.info(f"📋 Ver hoja: {sheet_url}")
             
             # Mostrar resumen de fórmulas agregadas
-            st.success("🧮 **Fórmulas dinámicas aplicadas (LOGÍSTICA MEJORADA - SIN ARS):**")
+            st.success("🧮 **Fórmulas dinámicas aplicadas (LOGÍSTICA MEJORADA - FÓRMULAS CORREGIDAS):**")
             formulas_info = [
                 "✅ Subtotal FOB = Cantidad × Precio Unitario (E×F)",
                 "✅ Derechos = Subtotal FOB × % Derechos (G×K)",
                 "✅ Tasa Estadística = Subtotal FOB × % Tasa (G×M)",
                 "✅ IVA = (Base + Derechos + Tasa) × % IVA",
                 "✅ Percepciones calculadas según normativa argentina",
-                "✅ Honorarios = 2% del Subtotal FOB (G×0,02)",
+                "✅ Honorarios = 2% del Subtotal FOB (G×0;02)",
                 "📦 NUEVO: Columnas específicas para embalaje múltiple",
                 "⚖️ Peso Total Envío, Volumen Total, Peso Facturable",
                 "📊 Núm. Cajas, Dimensiones Caja, Unidades/Caja",
@@ -5171,7 +5226,8 @@ def upload_to_google_sheets(data_dict, worksheet_name="Cotizaciones APP IA"):
                 "❌ ELIMINADO: Conversión a ARS (solo USD)",
                 "✅ Formato optimizado: USD, kg, m³, cantidades",
                 "🎯 VENTAJA: Claridad total entre embalaje individual vs múltiple",
-                "🔢 Fórmulas con formato argentino (comas como separador decimal)"
+                "🔧 CORREGIDO: Fórmulas con separador ';' (formato argentino)",
+                "🔧 CORREGIDO: Funciones IF con sintaxis IF(condición; valor_si; valor_no)"
             ]
             for info in formulas_info:
                 st.write(f"  {info}")

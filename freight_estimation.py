@@ -3,7 +3,7 @@ import numpy as np
 import os
 
 def load_freight_rates(file_path):
-    """Carga las tarifas de flete desde un archivo CSV."""
+    """Carga las tarifas de flete desde un archivo CSV (mantener para compatibilidad)."""
     try:
         df = pd.read_csv(file_path)
         # Convertir todas las columnas a numérico, forzando errores a NaN
@@ -15,22 +15,35 @@ def load_freight_rates(file_path):
     except FileNotFoundError:
         return None
 
-def calculate_air_freight(weight, rates_df):
+def calculate_air_freight_by_origin(weight_kg, origin_country):
     """
-    Calcula el costo del flete aéreo para la Zona 5 basado en el peso,
-    utilizando interpolación lineal.
-    """
-    if rates_df is None or 'KG' not in rates_df.columns or 'Zona 5' not in rates_df.columns:
-        return 0.0
-
-    # Asegurarse que los datos están ordenados por KG
-    rates_df = rates_df.sort_values(by='KG').reset_index(drop=True)
-
-    # Usar np.interp para la interpolación lineal
-    # Asume que rates_df['KG'] y rates_df['Zona 5'] son los puntos conocidos
-    cost = np.interp(weight, rates_df['KG'], rates_df['Zona 5'])
+    Calcula el costo del flete aéreo basado en el país de origen y peso.
     
-    return cost
+    Args:
+        weight_kg (float): Peso en kilogramos
+        origin_country (str): País de origen ('CN' para China, 'US' para USA)
+    
+    Returns:
+        float: Costo del flete en USD
+    """
+    # Tarifas fijas por kg según país de origen
+    rates = {
+        'CN': 27.0,  # China a Argentina: 27 USD/kg
+        'US': 13.5   # USA a Argentina: 13.5 USD/kg
+    }
+    
+    # Usar China como default si el país no está especificado o no está en la lista
+    rate_per_kg = rates.get(origin_country, rates['CN'])
+    
+    return weight_kg * rate_per_kg
+
+def calculate_air_freight(weight, rates_df=None):
+    """
+    Función legacy para compatibilidad con código existente.
+    Ahora usa el nuevo sistema de tarifas por país de origen.
+    Asume China como origen por defecto.
+    """
+    return calculate_air_freight_by_origin(weight, 'CN')
 
 def calculate_sea_freight(volume_m3):
     """
@@ -40,29 +53,41 @@ def calculate_sea_freight(volume_m3):
     return volume_m3 * cost_per_m3
 
 if __name__ == '__main__':
-    # Test del módulo
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_path = os.path.join(current_dir, 'pdf_reader', 'extracted_tables.csv')
-
-    rates = load_freight_rates(csv_path)
-
-    if rates is not None:
-        print("Tarifas cargadas exitosamente:")
-        print(rates.head())
-
-        # Test de flete aéreo
-        test_weight = 220.5
-        air_cost = calculate_air_freight(test_weight, rates)
-        print(f"\nCosto de flete aéreo para {test_weight} kg: ${air_cost:.2f}")
-        
-        test_weight_exact = 220.0
-        air_cost_exact = calculate_air_freight(test_weight_exact, rates)
-        print(f"Costo de flete aéreo para {test_weight_exact} kg: ${air_cost_exact:.2f}")
-
-
-        # Test de flete marítimo
-        test_volume = 1.5  # m3
-        sea_cost = calculate_sea_freight(test_volume)
-        print(f"Costo de flete marítimo para {test_volume} m³: ${sea_cost:.2f}")
-    else:
-        print(f"No se pudo cargar el archivo de tarifas en: {csv_path}") 
+    # Test del módulo con nuevas tarifas fijas
+    print("=== TEST DE NUEVO SISTEMA DE FLETES ===\n")
+    
+    # Test de flete aéreo por país de origen
+    test_weight = 5.0
+    
+    print("🇨🇳 CHINA → ARGENTINA:")
+    china_cost = calculate_air_freight_by_origin(test_weight, 'CN')
+    print(f"Peso: {test_weight} kg")
+    print(f"Tarifa: 27.0 USD/kg")
+    print(f"Costo total: ${china_cost:.2f} USD\n")
+    
+    print("🇺🇸 USA → ARGENTINA:")
+    usa_cost = calculate_air_freight_by_origin(test_weight, 'US')
+    print(f"Peso: {test_weight} kg")
+    print(f"Tarifa: 13.5 USD/kg")
+    print(f"Costo total: ${usa_cost:.2f} USD\n")
+    
+    print("🚢 FLETE MARÍTIMO:")
+    test_volume = 1.5  # m3
+    sea_cost = calculate_sea_freight(test_volume)
+    print(f"Volumen: {test_volume} m³")
+    print(f"Tarifa: 90.0 USD/m³")
+    print(f"Costo total: ${sea_cost:.2f} USD\n")
+    
+    # Test de compatibilidad con función legacy
+    print("🔄 TEST DE COMPATIBILIDAD:")
+    legacy_cost = calculate_air_freight(test_weight)
+    print(f"Función legacy (asume China): ${legacy_cost:.2f} USD")
+    print(f"Función nueva (China explícito): ${china_cost:.2f} USD")
+    print(f"Resultado igual: {'✅' if abs(legacy_cost - china_cost) < 0.01 else '❌'}")
+    
+    print("\n=== COMPARACIÓN DE COSTOS CHINA vs USA ===")
+    print(f"Peso de prueba: {test_weight} kg")
+    print(f"China: ${china_cost:.2f} USD ({china_cost/test_weight:.1f} USD/kg)")
+    print(f"USA: ${usa_cost:.2f} USD ({usa_cost/test_weight:.1f} USD/kg)")
+    print(f"Diferencia: ${abs(china_cost - usa_cost):.2f} USD")
+    print(f"USA es {'más barato' if usa_cost < china_cost else 'más caro'} que China") 
