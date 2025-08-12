@@ -56,8 +56,8 @@ class FedExRatesAPI:
     def __init__(self, credentials: Optional[FedExCredentials] = None):
         if credentials is None:
             credentials = FedExCredentials(
-                client_id=os.getenv("FEDEX_API_KEY", ""),
-                client_secret=os.getenv("FEDEX_SECRET_KEY", ""),
+                client_id=os.getenv("FEDEX_CLIENT_ID", os.getenv("FEDEX_API_KEY", "")),
+                client_secret=os.getenv("FEDEX_CLIENT_SECRET", os.getenv("FEDEX_SECRET_KEY", "")),
                 account_number=os.getenv("FEDEX_ACCOUNT_NUMBER", ""),
                 test_mode=os.getenv("FEDEX_TEST_MODE", "true").lower() in {"1", "true", "yes", "y"},
             )
@@ -173,7 +173,7 @@ class FedExRatesAPI:
         weight_units: str = "KG",
         currency: str = "USD",
         ship_date: Optional[datetime] = None,
-        pickup_type: str = "USE_SCHEDULED_PICKUP",
+        pickup_type: str = "DROPOFF_AT_FEDEX_LOCATION",
         return_transit_times: bool = True,
     ) -> Dict[str, Any]:
         """Create a minimal valid payload for comprehensive rates.
@@ -217,6 +217,12 @@ class FedExRatesAPI:
                         "weight": {
                             "units": weight_units,
                             "value": float(weight_value),
+                        },
+                        "dimensions": {
+                            "length": 25 if weight_value <= 5 else 35,
+                            "width": 30 if weight_value <= 5 else 45,
+                            "height": 15 if weight_value <= 5 else 20,
+                            "units": "CM"
                         }
                     }
                 ],
@@ -241,7 +247,7 @@ class FedExRatesAPI:
                         "quantityUnits": "PCS",
                         "countryOfManufacture": shipper_country,
                         "weight": {"units": weight_units, "value": float(weight_value)},
-                        "customsValue": {"amount": 100, "currency": currency}
+                        "customsValue": {"amount": max(100, float(weight_value) * 50), "currency": currency}
                     }
                 ]
             }
@@ -365,8 +371,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     creds = FedExCredentials(
-        client_id=os.getenv("FEDEX_API_KEY", ""),
-        client_secret=os.getenv("FEDEX_SECRET_KEY", ""),
+        client_id=os.getenv("FEDEX_CLIENT_ID", os.getenv("FEDEX_API_KEY", "")),
+        client_secret=os.getenv("FEDEX_CLIENT_SECRET", os.getenv("FEDEX_SECRET_KEY", "")),
         account_number=os.getenv("FEDEX_ACCOUNT_NUMBER", ""),
         test_mode=_parse_bool(str(args.test_mode)),
     )

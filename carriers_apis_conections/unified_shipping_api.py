@@ -118,6 +118,16 @@ class UnifiedShippingAPI:
         """Log debug messages"""
         if self.debug:
             print(f"[UnifiedAPI] {message}")
+            
+            # También añadir a Streamlit si está disponible
+            try:
+                import streamlit as st
+                if hasattr(st.session_state, 'unified_api_debug_logs'):
+                    st.session_state.unified_api_debug_logs.append(f"[UnifiedAPI] {message}")
+                else:
+                    st.session_state.unified_api_debug_logs = [f"[UnifiedAPI] {message}"]
+            except:
+                pass  # Streamlit no disponible o session_state no accesible
     
     def _normalize_weight_to_kg(self, weight: float, unit: str) -> float:
         """Convertir peso a kilogramos"""
@@ -273,11 +283,17 @@ class UnifiedShippingAPI:
         try:
             self._debug_log(f"🚀 Querying DHL for {request.weight_kg}kg")
             
-            # Build DHL request
-            dimensions = request.dimensions_cm or {"length": 25, "width": 35, "height": 15}
+            # Build DHL request - dimensiones más realistas para 2kg
+            weight_kg = request.weight_kg
+            if weight_kg <= 1:
+                dimensions = request.dimensions_cm or {"length": 20, "width": 25, "height": 10}
+            elif weight_kg <= 5:
+                dimensions = request.dimensions_cm or {"length": 25, "width": 30, "height": 15}
+            else:
+                dimensions = request.dimensions_cm or {"length": 35, "width": 45, "height": 20}
             
             tomorrow = datetime.now() + timedelta(days=1)
-            shipping_date = tomorrow.strftime("%Y-%m-%dT%H:%M:%S GMT-03:00")
+            shipping_date = tomorrow.strftime("%Y-%m-%dT%H:%M:%SGMT-03:00")
             
             # Normalize postal codes for DHL requirements
             origin_postal_normalized = self._normalize_postal_code(request.origin_postal, request.origin_country)
@@ -313,8 +329,8 @@ class UnifiedShippingAPI:
                 "nextBusinessDay": True,  # Required field
                 "monetaryAmount": [{
                     "typeCode": "declaredValue",
-                    "value": 100,
-                    "currency": "USD"  # DHL test might expect USD for international
+                    "value": max(100, request.weight_kg * 50),
+                    "currency": "USD"  # Usar USD para consistencia
                 }],
                 "packages": [{
                     "weight": request.weight_kg,
@@ -482,8 +498,26 @@ class UnifiedShippingAPI:
         
         self._debug_log(f"🔍 Finding best rate for {weight_kg}kg from {origin_country} to {dest_country}")
         
-        # Get all quotes
+        # Get all quotes with detailed logging
         all_quotes = self.get_all_quotes(request)
+        
+        # Debug: Log detailed info about each carrier's response
+        self._debug_log("📊 Detailed carrier analysis:")
+        for carrier, quotes in all_quotes.items():
+            successful_quotes = [q for q in quotes if q.success and q.cost_usd > 0]
+            failed_quotes = [q for q in quotes if not q.success]
+            
+            self._debug_log(f"   {carrier}: {len(successful_quotes)} successful, {len(failed_quotes)} failed")
+            
+            if successful_quotes:
+                costs = [q.cost_usd for q in successful_quotes]
+                self._debug_log(f"   {carrier} prices: ${min(costs):.2f} - ${max(costs):.2f} USD")
+                for i, quote in enumerate(successful_quotes[:3], 1):  # Top 3
+                    self._debug_log(f"     Option {i}: {quote.service_name} - ${quote.cost_usd:.2f} ({quote.transit_days or 'N/A'} days)")
+            
+            if failed_quotes:
+                for quote in failed_quotes:
+                    self._debug_log(f"   {carrier} ERROR: {quote.error_message}")
         
         # Flatten and filter successful quotes
         valid_quotes = []
@@ -541,6 +575,7 @@ def get_cheapest_shipping_rate(weight_kg: float,
                               origin_postal: str = "38125", 
                               dest_country: str = "AR",
                               dest_postal: str = "C1000",
+                              dimensions_cm: Optional[Dict[str, float]] = None,
                               test_mode: bool = True,
                               debug: bool = False) -> Dict[str, Any]:
     """
@@ -556,7 +591,8 @@ def get_cheapest_shipping_rate(weight_kg: float,
         origin_country=origin_country,
         origin_postal=origin_postal,
         dest_country=dest_country,
-        dest_postal=dest_postal
+        dest_postal=dest_postal,
+        dimensions_cm=dimensions_cm
     )
 
 

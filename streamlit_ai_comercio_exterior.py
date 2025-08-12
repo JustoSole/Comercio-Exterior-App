@@ -2459,7 +2459,7 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
                 }
                 
                 debug_log(f"✅ Flete marítimo calculado: ${costo_flete_total_usd:.2f} para {volumen_total_cbm:.6f} m³ a 90 USD/m³", level="SUCCESS")
-                else:
+            else:
                 # Sin dimensiones válidas, no calcular flete marítimo
                 costo_flete_total_usd = 0
                 metodo_calculo = "Sin dimensiones válidas"
@@ -2474,7 +2474,7 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
                 
                 debug_log("❌ No se puede calcular flete marítimo sin dimensiones válidas", level="ERROR")
         
-                    else:
+        else:
             # Tipo de flete no reconocido, usar China como default
             costo_flete_total_usd = calculate_air_freight_by_origin(peso_facturable_kg, 'CN')
             metodo_calculo = "Fallback: Tarifa fija China-Argentina: 27 USD/kg"
@@ -2492,10 +2492,10 @@ def execute_landed_cost_calculation(tipo_importador, destino_importacion, provin
             debug_log(f"⚠️ Tipo de flete no reconocido: {tipo_flete}. Usando China como fallback.", level="WARNING")
         
         # Información de sesión para compatibilidad con código existente
-                result_session_data = {
-                    'dhl_insurance_cost': 0.0,
-                    'dhl_argentina_taxes': 0.0,
-                    'dhl_insurance_included': False,
+        result_session_data = {
+            'dhl_insurance_cost': 0.0,
+            'dhl_argentina_taxes': 0.0,
+            'dhl_insurance_included': False,
             'dhl_taxes_included': False,
             'cost_breakdown': {},
             'test_mode': True,

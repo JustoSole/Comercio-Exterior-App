@@ -118,7 +118,7 @@ class DHLRatesAPI:
             
             # Fecha dinámica (mañana) en formato correcto
             tomorrow = datetime.now() + timedelta(days=1)
-            shipping_date = tomorrow.strftime("%Y-%m-%dT%H:%M:%S GMT-03:00")
+            shipping_date = tomorrow.strftime("%Y-%m-%dT%H:%M:%SGMT-03:00")
             
             return {
                 "customerDetails": {
@@ -156,7 +156,7 @@ class DHLRatesAPI:
         else:
             # Fallback cuando no hay configuración centralizada
             tomorrow = datetime.now() + timedelta(days=1)
-            shipping_date = tomorrow.strftime("%Y-%m-%dT%H:%M:%S GMT-03:00")
+            shipping_date = tomorrow.strftime("%Y-%m-%dT%H:%M:%SGMT-03:00")
             
             return {
                 "customerDetails": {

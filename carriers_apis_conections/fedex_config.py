@@ -15,17 +15,17 @@ def get_fedex_credentials_from_secrets():
     try:
         import streamlit as st
         return {
-            "client_id": st.secrets["api_keys"]["FEDEX_CLIENT_ID"],
-            "client_secret": st.secrets["api_keys"]["FEDEX_CLIENT_SECRET"],
-            "account_number": st.secrets["api_keys"]["FEDEX_ACCOUNT_NUMBER"]
+            "client_id": "l7fab5c57a5b444d73885fa6fcf50f04d2",
+            "client_secret": "588c66fcb49d451fae41734cd6e0a8bd", 
+            "account_number": "740561073"
         }
     except Exception:
         # Fallback para scripts que no usan Streamlit
         import os
         return {
-            "client_id": os.getenv("FEDEX_CLIENT_ID", ""),
-            "client_secret": os.getenv("FEDEX_CLIENT_SECRET", ""),
-            "account_number": os.getenv("FEDEX_ACCOUNT_NUMBER", "")
+            "client_id": "l7fab5c57a5b444d73885fa6fcf50f04d2",
+            "client_secret": "588c66fcb49d451fae41734cd6e0a8bd",
+            "account_number": "740561073"
         }
 
 # URLs de API

@@ -26,7 +26,7 @@ def get_dhl_credentials_from_secrets():
             "account_number": os.getenv("DHL_ACCOUNT_NUMBER", "")
         }
 
-# URLs de API
+# URLs de API - Usando formato estándar
 DHL_URLS = {
     "test": "https://express.api.dhl.com/mydhlapi/test/rates",
     "production": "https://express.api.dhl.com/mydhlapi/rates"
